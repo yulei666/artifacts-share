@@ -1599,29 +1599,39 @@ describe('review regressions (round 10)', () => {
 describe('review regressions (round 11)', () => {
   const jsonHeaders = { 'content-type': 'application/json' };
 
-  it('never deletes a file from a version committed while the file was in flight', async () => {
+  it('publishes only after an in-flight replacement and its metadata are complete', async () => {
     const { env } = await import('cloudflare:workers');
-    const { putUploadFile } = await import('../src/lib/store');
+    const { commitUpload, putUploadFile, requireUpload } = await import('../src/lib/store');
     const { getSettings } = await import('../src/lib/settings');
-    const a = await createHtml('<p>v1</p>', '?visibility=public');
-    const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ artifact_id: a.id }) }), 201);
-    const row = await env.DB.prepare('SELECT * FROM uploads WHERE id = ?').bind(up.upload_id).first<any>();
-    // the commit lands between the PUT's open-check and its liveness check
+    const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ visibility: 'public' }) }), 201);
+    const row = await requireUpload(env, up.upload_id);
+    const settings = await getSettings(env);
+    await putUploadFile(env, row, 'index.html', '<p>original</p>', settings);
+    const replacement = '<p>replacement with a different size</p>';
     const bucket = new Proxy(env.BUCKET, {
-      get: (t, p) =>
-        p === 'put'
-          ? async (...args: any[]) => {
-              const r = await (t as any).put(...args);
-              await env.DB.batch([
-                env.DB.prepare("UPDATE artifact_versions SET status = 'ready' WHERE artifact_id = ? AND version = ?").bind(a.id, up.version),
-                env.DB.prepare('DELETE FROM uploads WHERE id = ?').bind(up.upload_id),
-              ]);
-              return r;
-            }
-          : (t as any)[p],
+      get: (target, property) => property === 'put' ? async (key: string, body: string, options: R2PutOptions) => {
+        const stored = await target.put(key, body, options);
+        await expect(commitUpload(env, row, settings)).rejects.toMatchObject({ code: 'upload_busy' });
+        await expect(putUploadFile(env, row, 'index.html', 'overlap', settings)).rejects.toMatchObject({ code: 'file_busy' });
+        return stored;
+      } : Reflect.get(target, property, target),
     });
-    await expect(putUploadFile({ ...(env as any), BUCKET: bucket }, row, 'index.html', '<p>v2</p>', await getSettings(env as any))).rejects.toThrow(/committed/);
-    expect(await env.BUCKET.head(`a/${a.id}/v${up.version}/index.html`)).not.toBeNull(); // kept
+    await putUploadFile({ ...env, BUCKET: bucket }, row, 'index.html', replacement, settings);
+    await commitUpload(env, row, settings);
+    const detail = await json(await api(`/api/v1/artifacts/${up.artifact_id}`), 200);
+    expect(detail).toMatchObject({ file_count: 1, total_size: replacement.length });
+    expect(await (await fetchRaw(detail.content_url)).text()).toBe(replacement);
+  });
+
+  it('rotates the code when a stale password-mode snapshot follows a public switch', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { patchArtifact, requireArtifact } = await import('../src/lib/store');
+    const a = await createHtml('<p>original</p>', '?visibility=password');
+    const stale = await requireArtifact(env, a.id);
+    await patchArtifact(env, stale, { visibility: 'public' });
+    const current = await patchArtifact(env, stale, { visibility: 'password' });
+    expect(current.password_ver).toBe(stale.password_ver + 1);
+    expect(current.password_enc).not.toBe(stale.password_enc);
   });
 
   it('keeps a version marked retiring until its files are gone, and finishes later', async () => {
@@ -1636,6 +1646,7 @@ describe('review regressions (round 11)', () => {
     expect(act.status).toBe(404); // can't go live while retiring
     await act.arrayBuffer();
     expect(await retireVersion(env as any, a.id, 1)).toBe(true);
+    expect(await env.DB.prepare('SELECT status FROM artifact_versions WHERE artifact_id = ? AND version = 1').bind(a.id).first()).toEqual({ status: 'retired' });
     expect(await env.BUCKET.head(`a/${a.id}/v1/index.html`)).toBeNull();
   });
 
@@ -1665,5 +1676,112 @@ describe('review regressions (round 11)', () => {
     const res = await fetchRaw(`${MAIN}/api/v1/tokens`, { method: 'POST', headers: { ...jsonHeaders, ...ORIGIN, cookie: session }, body: '{oops' });
     expect(res.status).toBe(400);
     expect((await res.json<any>()).error.code).toBe('invalid_json');
+  });
+});
+
+describe('publishing and authentication consistency', () => {
+  const jsonHeaders = { 'content-type': 'application/json' };
+
+  it('requires a new publication snapshot if a write finishes before the commit transaction', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { commitUpload, putUploadFile, requireUpload } = await import('../src/lib/store');
+    const { getSettings } = await import('../src/lib/settings');
+    const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: jsonHeaders, body: '{}' }), 201);
+    const upload = await requireUpload(env, up.upload_id);
+    const settings = await getSettings(env);
+    await putUploadFile(env, upload, 'index.html', '<p>index</p>', settings);
+    let batches = 0;
+    const database = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === 'prepare') return target.prepare.bind(target);
+        if (property === 'batch') return async (statements: D1PreparedStatement[]) => {
+          if (++batches === 2) await putUploadFile(env, upload, 'app.js', 'void 0;', settings);
+          return target.batch(statements);
+        };
+        return Reflect.get(target, property, target);
+      },
+    });
+    await expect(commitUpload({ ...env, DB: database }, upload, settings)).rejects.toMatchObject({ code: 'upload_busy' });
+    const published = await commitUpload(env, upload, settings);
+    const detail = await json(await api(`/api/v1/artifacts/${published.id}`), 200);
+    expect(detail).toMatchObject({ file_count: 2, kind: 'folder' });
+  });
+
+  it('rejects an entry that belonged only to the version seen by an older reader', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { patchArtifact, requireArtifact } = await import('../src/lib/store');
+    const a = await createHtml('<p>old</p>', '?filename=old.html');
+    const stale = await requireArtifact(env, a.id);
+    await json(await api(`/api/v1/artifacts/${a.id}/content?filename=new.html`, {
+      method: 'PUT', headers: { 'content-type': 'text/html' }, body: '<p>new</p>',
+    }), 200);
+    await expect(patchArtifact(env, stale, { entry: 'old.html' })).rejects.toMatchObject({ code: 'invalid_entry' });
+    expect((await requireArtifact(env, a.id)).entry).toBe('new.html');
+  });
+
+  it('serves cached public files with browser-only caching and honors strict preconditions', async () => {
+    const a = await createHtml('<p>cached</p>', '?visibility=public');
+    const initial = await fetchRaw(a.content_url);
+    const tag = initial.headers.get('etag')!;
+    expect(initial.headers.get('cache-control')).toBe('private, max-age=0, must-revalidate');
+    await initial.arrayBuffer();
+    const cached = await fetchRaw(a.content_url, { headers: { 'if-none-match': `W/${tag}` } });
+    expect(cached.status).toBe(304);
+    expect(cached.headers.get('cache-control')).toBe('private, max-age=0, must-revalidate');
+    for (const method of ['GET', 'HEAD']) {
+      const strict = await fetchRaw(a.content_url, { method, headers: { 'if-match': `W/${tag}` } });
+      expect(strict.status).toBe(412);
+    }
+    const resume = await fetchRaw(a.content_url, { headers: { range: 'bytes=0-2', 'if-range': '"other-version"' } });
+    expect(resume.status).toBe(200);
+    expect(await resume.text()).toBe('<p>cached</p>');
+    await json(await api(`/api/v1/artifacts/${a.id}`, { method: 'PATCH', headers: jsonHeaders, body: JSON.stringify({ visibility: 'private' }) }), 200);
+    const denied = await fetchRaw(a.content_url, { headers: { 'if-none-match': tag } });
+    expect(denied.status).toBe(404);
+    await denied.arrayBuffer();
+  });
+
+  it('guards the last usable login method at the database write', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { updateSettings } = await import('../src/lib/settings');
+    const { setBinding } = await import('../src/main/oauth');
+    await setBinding(env, 'github', 'review-test', 'Review test');
+    try {
+      const results = await Promise.allSettled([
+        updateSettings(env, { password_login_enabled: false }),
+        setBinding(env, 'github', null, null),
+      ]);
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1);
+      const methods = await json(await fetchRaw(`${MAIN}/api/auth/methods`), 200);
+      expect(methods.password || methods.sso.length > 0).toBe(true);
+    } finally {
+      await updateSettings(env, { password_login_enabled: true });
+      await setBinding(env, 'github', null, null);
+    }
+  });
+
+  it('accepts an OAuth bind callback only from the session that started it', async () => {
+    const { env } = await import('cloudflare:workers');
+    const other = cookieFrom(await fetchRaw(`${MAIN}/api/auth/login`, {
+      method: 'POST', headers: { ...jsonHeaders, ...ORIGIN },
+      body: JSON.stringify({ username: 'admin', password: 'correct horse battery' }),
+    }), 'as_session');
+    const start = await fetchRaw(`${MAIN}/api/auth/oauth/github/start?purpose=bind`, { headers: { cookie: session } });
+    const state = new URL(start.headers.get('location')!).searchParams.get('state')!;
+    const callback = `${MAIN}/api/auth/oauth/github/callback?state=${state}&error=cancelled`;
+    const rejected = await fetchRaw(callback, { headers: { cookie: other } });
+    expect(rejected.headers.get('location')).toContain('error=sso_state');
+    const allowed = await fetchRaw(callback, { headers: { cookie: session } });
+    expect(allowed.headers.get('location')).toContain('sso_error=sso_denied');
+    expect(await env.DB.prepare('SELECT 1 FROM oauth_states WHERE state = ?').bind(state).first()).toBeNull();
+  });
+
+  it('downloads an HTML artifact whose title reaches the filename limit with an emoji', async () => {
+    const a = await createHtml('<p>unicode</p>', `?title=${encodeURIComponent('x'.repeat(99) + '😀')}`);
+    const res = await fetchRaw(`${MAIN}/s/${a.public_id}/download`, { headers: { cookie: session } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-disposition')).toContain('%F0%9F%98%80.html');
+    await res.arrayBuffer();
   });
 });

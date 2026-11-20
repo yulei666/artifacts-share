@@ -6,16 +6,17 @@ import type { Settings } from './settings';
 
 /** Extracts a zip archive in memory, enforcing entry-count and size limits (zip-bomb guard). */
 export function extractZip(data: Uint8Array, settings: Settings): IncomingFile[] {
-  let entries = 0;
+  const names = new Set<string>();
   let declared = 0;
   let out: Record<string, Uint8Array>;
   try {
     out = unzipSync(data, {
       filter(file) {
         if (file.name.endsWith('/') || isIgnoredPath(file.name)) return false;
-        entries++;
-        declared += file.originalSize;
-        if (entries > settings.unzip_max_files) throw new HttpError(413, 'zip_too_many_files', `Zip has more than ${settings.unzip_max_files} files`);
+        if (names.has(file.name)) throw new HttpError(400, 'duplicate_path', 'Duplicate file paths');
+        names.add(file.name);
+        declared += file.compression === 0 ? Math.max(file.size, file.originalSize) : file.originalSize;
+        if (names.size > settings.unzip_max_files) throw new HttpError(413, 'zip_too_many_files', `Zip has more than ${settings.unzip_max_files} files`);
         if (declared > settings.unzip_max_bytes) throw new HttpError(413, 'zip_too_large', `Zip expands beyond ${settings.unzip_max_bytes} bytes`);
         return true;
       },

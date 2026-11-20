@@ -32,7 +32,8 @@ export async function downloadAccess(env: Env, a: ArtifactRow, owner: boolean, o
 /** Safe download file name from the title (falls back to `fallback`). */
 function fileName(title: string, fallback: string, ext: string): string {
   // eslint-disable-next-line no-control-regex
-  const base = title.replace(/[\\/:*?"<>|\x00-\x1f\x7f]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 100) || fallback;
+  const clean = title.replace(/[\\/:*?"<>|\x00-\x1f\x7f]/g, '_').replace(/\s+/g, ' ').trim();
+  const base = Array.from(clean).slice(0, 100).join('') || fallback;
   return base.toLowerCase().endsWith(ext) ? base : `${base}${ext}`;
 }
 
@@ -40,7 +41,7 @@ function fileName(title: string, fallback: string, ext: string): string {
 export function disposition(name: string): string {
   const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
   // RFC 5987 attr-chars exclude ' ( ) * — encodeURIComponent leaves those, so escape them too.
-  const ext = encodeURIComponent(name).replace(/['()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+  const ext = encodeURIComponent(name.toWellFormed()).replace(/['()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
   return `attachment; filename="${ascii}"; filename*=UTF-8''${ext}`;
 }
 

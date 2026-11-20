@@ -5,7 +5,6 @@ import { contentOrigin, isUuid } from '../lib/hosts';
 import { clientIp, HttpError, jsonError, now, readJsonObject, safeRelativePath } from '../lib/http';
 import { peekAttempts } from '../lib/ratelimit';
 import { guardedAttempt, loginBucket } from '../lib/access';
-import { forgetSessions } from '../lib/sessioncache';
 import { CAPTCHA_AFTER_FAILS, turnstileEnabled } from '../lib/turnstile';
 import { getInternal, getSettings, setInternal, updateSettings } from '../lib/settings';
 import { artifactView, getArtifact, getArtifactByPublicId, viewerUrl } from '../lib/store';
@@ -50,6 +49,7 @@ export const app = new Hono<AppEnv>();
 
 app.onError((err, c) => {
   if (err instanceof HttpError) return jsonError(err.status, err.code, err.message, err.details);
+  if (err.message.includes('sign_in_method_required')) return jsonError(400, 'lockout', 'Keep at least one other sign-in method enabled');
   console.error(err);
   return jsonError(500, 'internal_error', 'Internal error');
 });
@@ -161,10 +161,12 @@ app.post('/api/auth/login', async (c) => {
   if (hash && !settings.password_login_enabled) throw new HttpError(403, 'password_login_disabled', 'Password sign-in is disabled');
   if (!hash && !c.env.ADMIN_BOOTSTRAP_PASSWORD) throw new HttpError(503, 'not_configured', 'ADMIN_BOOTSTRAP_PASSWORD is not set');
 
+  const storedUsername = await getInternal(c.env, 'admin_username');
+  const expectedUsername = storedUsername ?? (c.env.ADMIN_USERNAME?.trim() || 'admin');
   const method = hash ? 'password' : 'bootstrap';
   const result = await guardedAttempt(c.env, c.req.raw, loginBucket(c.req.raw), typeof turnstile_token === 'string' ? turnstile_token : null, async () => {
     // Both checked (no early return), and the error never says which of the two was wrong.
-    const userOk = timingSafeEqualStr(username.trim().toLowerCase(), (await adminUsername(c.env)).toLowerCase());
+    const userOk = timingSafeEqualStr(username.trim().toLowerCase(), expectedUsername.toLowerCase());
     const passOk = hash ? await verifyPassword(password, hash) : timingSafeEqualStr(password, c.env.ADMIN_BOOTSTRAP_PASSWORD!);
     return userOk && passOk;
   });
@@ -173,7 +175,7 @@ app.post('/api/auth/login', async (c) => {
     if (result.reason === 'locked') throw new HttpError(429, 'rate_limited', 'Too many attempts, try again later', { retry_after: result.retryAfter });
     throw new HttpError(401, 'invalid_credentials', 'Incorrect username or password');
   }
-  c.header('set-cookie', await createSession(c.env, c.req.raw, method));
+  c.header('set-cookie', await createSession(c.env, c.req.raw, method, { hash, username: storedUsername }));
   return c.json({ ok: true, needs_password_setup: method === 'bootstrap' });
 });
 
@@ -185,7 +187,6 @@ app.post('/api/auth/logout', async (c) => {
 
 app.post('/api/auth/logout-all', requireSession, async (c) => {
   await c.env.DB.prepare('DELETE FROM sessions').run();
-  forgetSessions();
   c.header('set-cookie', await destroySession(c.env, sessionOf(c)!.sessionId));
   return c.json({ ok: true });
 });
@@ -206,7 +207,7 @@ app.get('/api/auth/oauth/:provider/start', async (c) => {
   }
   const fallback = purpose === 'bind' ? '/#/settings' : '/';
   try {
-    return c.redirect(await startUrl(c.env, new URL(c.req.url), p, purpose, c.req.query('redirect_to') ?? fallback));
+    return c.redirect(await startUrl(c.env, new URL(c.req.url), p, purpose, c.req.query('redirect_to') ?? fallback, sessionOf(c)?.sessionId));
   } catch (e) {
     if (!(e instanceof HttpError)) throw e;
     return ssoErrorRedirect(c, purpose, e.code, e.message);
@@ -216,18 +217,20 @@ app.get('/api/auth/oauth/:provider/start', async (c) => {
 app.get('/api/auth/oauth/:provider/callback', async (c) => {
   const p = providerParam(c);
   try {
-    const r = await handleCallback(c.env, new URL(c.req.url), p);
+    const s = sessionOf(c);
+    const r = await handleCallback(c.env, new URL(c.req.url), p, s?.method === 'bootstrap' ? undefined : s?.sessionId);
     if (r.purpose === 'bind') {
-      const s = sessionOf(c);
       if (!s || s.method === 'bootstrap') return ssoErrorRedirect(c, 'login', 'sso_session_expired', 'Session expired; sign in and bind again');
-      await setBinding(c.env, p, r.subject, r.display);
+      await setBinding(c.env, p, r.subject, r.display, { config: r.config, sessionId: s.sessionId });
       return c.redirect(`/#/settings?sso_bound=${p}`);
     }
     const row = await getProvider(c.env, p);
-    if (!canLogin(row) || row.bound_subject !== r.subject) {
+    if (!canLogin(row) || row.bound_subject !== r.subject || row.client_id !== r.config.client_id || row.client_secret_enc !== r.config.client_secret_enc || row.issuer !== r.config.issuer) {
       return ssoErrorRedirect(c, 'login', 'sso_not_allowed', 'This account is not allowed to sign in');
     }
-    c.header('set-cookie', await createSession(c.env, c.req.raw, p));
+    c.header('set-cookie', await createSession(c.env, c.req.raw, p, {
+      subject: r.subject, clientId: r.config.client_id, secret: r.config.client_secret_enc, issuer: r.config.issuer,
+    }));
     return c.redirect(safeRelativePath(r.redirectTo));
   } catch (e) {
     if (!(e instanceof HttpError)) throw e;
@@ -271,15 +274,32 @@ app.put('/api/settings/password', async (c) => {
   if (hash && (typeof body.current_password !== 'string' || !(await verifyPassword(body.current_password, hash)))) {
     throw new HttpError(403, 'wrong_current_password', 'Current password is incorrect');
   }
-  await setInternal(c.env, 'admin_password_hash', await hashPassword(body.new_password));
-  if (username) await setInternal(c.env, 'admin_username', username);
-  // A password change is often a reaction to a leak: sign out every other session (and, with them, the
-  // owner cookies on content hosts that are bound to them). This one stays, upgraded from bootstrap.
-  await c.env.DB.batch([
-    c.env.DB.prepare("UPDATE sessions SET method = 'password' WHERE id = ? AND method = 'bootstrap'").bind(s.sessionId),
-    c.env.DB.prepare('DELETE FROM sessions WHERE id != ?').bind(s.sessionId),
-  ]);
-  forgetSessions();
+  const newHash = await hashPassword(body.new_password);
+  const t = now();
+  const changed = "(SELECT value FROM settings WHERE key = 'admin_password_hash') = ?";
+  const statements = [
+    c.env.DB.prepare(
+      `INSERT INTO settings (key, value, updated_at)
+       SELECT 'admin_password_hash', ?, ? WHERE (SELECT value FROM settings WHERE key = 'admin_password_hash') IS ?
+         AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND expires_at > ?)
+       ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    ).bind(newHash, t, hash, s.sessionId, t),
+  ];
+  if (username) {
+    statements.push(c.env.DB.prepare(
+      `INSERT INTO settings (key, value, updated_at) SELECT 'admin_username', ?, ? WHERE ${changed}
+       ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    ).bind(username, t, newHash));
+  }
+  // Change credentials and revoke other sessions together. An earlier password check cannot overwrite
+  // a password already changed by another request.
+  statements.push(
+    c.env.DB.prepare(`UPDATE sessions SET method = 'password' WHERE id = ? AND method = 'bootstrap' AND ${changed}`).bind(s.sessionId, newHash),
+    c.env.DB.prepare(`DELETE FROM sessions WHERE id != ? AND ${changed}`).bind(s.sessionId, newHash),
+  );
+  const [result] = await c.env.DB.batch(statements);
+  if (!result.meta.changes) throw new HttpError(409, 'auth_config_changed', 'Sign-in settings changed; sign in again');
+
   return c.json({ ok: true });
 });
 
@@ -341,7 +361,10 @@ app.put('/api/settings/sso/:provider', async (c) => {
       patch[k] = body[k] as string;
     }
   }
-  if (body.enabled !== undefined) patch.enabled = !!body.enabled;
+  if (body.enabled !== undefined) {
+    if (typeof body.enabled !== 'boolean') throw new HttpError(400, 'invalid_request', 'enabled must be a boolean');
+    patch.enabled = body.enabled;
+  }
   const cur = await getProvider(c.env, p);
   // Anything that could break this provider's sign-in — including a new secret, which can't be validated
   // until someone signs in with it — is refused while it is the only way to sign in.

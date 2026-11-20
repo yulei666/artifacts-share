@@ -137,7 +137,7 @@ export async function artifactView(env: Env, a: ArtifactRow, ref: URL, opts: { w
  * A fresh code is issued whenever the artifact *enters* password mode, has none, or on reset; switching back
  * from private/public must not revive a code (or unlock cookies / download tokens) the owner meant to revoke.
  */
-async function metaChanges(env: Env, a: ArtifactRow, meta: ArtifactMeta, opts: { resetPassword?: boolean } = {}): Promise<{ sets: string[]; binds: unknown[] }> {
+async function metaChanges(env: Env, meta: ArtifactMeta, opts: { resetPassword?: boolean } = {}): Promise<{ sets: string[]; binds: unknown[] }> {
   const sets: string[] = [];
   const binds: unknown[] = [];
   const set = (col: string, v: unknown) => (sets.push(`${col} = ?`), binds.push(v));
@@ -146,26 +146,31 @@ async function metaChanges(env: Env, a: ArtifactRow, meta: ArtifactMeta, opts: {
   if (meta.indexable !== undefined) set('indexable', meta.indexable ? 1 : 0);
   if (meta.entry !== undefined) set('entry', meta.entry);
   if (meta.visibility !== undefined) set('visibility', meta.visibility);
-  const nextVis = meta.visibility ?? a.visibility;
-  const entering = nextVis === 'password' && a.visibility !== 'password';
-  if (nextVis === 'password' && (entering || !a.password_enc || opts.resetPassword)) {
-    set('password_enc', await encryptString(env.SECRET_KEY, randomAccessCode()));
-    sets.push('password_ver = password_ver + 1');
-  } else if (opts.resetPassword) {
-    throw new HttpError(400, 'not_password_protected', 'Artifact is not in password mode');
+  if (opts.resetPassword || meta.visibility === 'password') {
+    const rotate = opts.resetPassword ? '1' : "visibility != 'password' OR password_enc IS NULL";
+    sets.push(`password_enc = CASE WHEN ${rotate} THEN ? ELSE password_enc END`);
+    binds.push(await encryptString(env.SECRET_KEY, randomAccessCode()));
+    sets.push(`password_ver = password_ver + CASE WHEN ${rotate} THEN 1 ELSE 0 END`);
   }
   return { sets, binds };
 }
 
 export async function patchArtifact(env: Env, a: ArtifactRow, meta: ArtifactMeta, opts: { resetPassword?: boolean } = {}): Promise<ArtifactRow> {
-  if (meta.entry !== undefined) {
-    const exists = await env.DB.prepare('SELECT 1 FROM artifact_files WHERE artifact_id = ? AND version = ? AND path = ?').bind(a.id, a.current_version, meta.entry).first();
-    if (!exists) throw new HttpError(400, 'invalid_entry', `Entry file not found: ${meta.entry}`);
-  }
-  const { sets, binds } = await metaChanges(env, a, meta, opts);
+  const { sets, binds } = await metaChanges(env, meta, opts);
   sets.push('updated_at = ?');
-  binds.push(now());
-  await env.DB.prepare(`UPDATE artifacts SET ${sets.join(', ')} WHERE id = ?`).bind(...binds, a.id).run();
+  binds.push(now(), a.id);
+  const where = ['id = ?', 'deleted_at IS NULL'];
+  if (meta.entry !== undefined) {
+    where.push('EXISTS (SELECT 1 FROM artifact_files WHERE artifact_id = artifacts.id AND version = artifacts.current_version AND path = ?)');
+    binds.push(meta.entry);
+  }
+  if (opts.resetPassword) where.push("visibility = 'password'");
+  const result = await env.DB.prepare(`UPDATE artifacts SET ${sets.join(', ')} WHERE ${where.join(' AND ')}`).bind(...binds).run();
+  if (!result.meta.changes) {
+    await requireArtifact(env, a.id);
+    if (opts.resetPassword) throw new HttpError(400, 'not_password_protected', 'Artifact is not in password mode');
+    throw new HttpError(400, 'invalid_entry', `Entry file not found: ${meta.entry}`);
+  }
   return requireArtifact(env, a.id);
 }
 
@@ -174,14 +179,17 @@ export async function patchArtifact(env: Env, a: ArtifactRow, meta: ArtifactMeta
  * Optionally regenerates the access code as well.
  */
 export async function regenerateLink(env: Env, a: ArtifactRow, opts: { resetPassword?: boolean } = {}): Promise<ArtifactRow> {
-  if (opts.resetPassword && a.visibility !== 'password') throw new HttpError(400, 'not_password_protected', 'Artifact is not in password mode');
   const publicId = crypto.randomUUID();
   if (opts.resetPassword) {
-    await env.DB.prepare('UPDATE artifacts SET public_id = ?, password_enc = ?, password_ver = password_ver + 1, updated_at = ? WHERE id = ?')
+    const result = await env.DB.prepare("UPDATE artifacts SET public_id = ?, password_enc = ?, password_ver = password_ver + 1, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND visibility = 'password'")
       .bind(publicId, await encryptString(env.SECRET_KEY, randomAccessCode()), now(), a.id)
       .run();
+    if (!result.meta.changes) {
+      await requireArtifact(env, a.id);
+      throw new HttpError(400, 'not_password_protected', 'Artifact is not in password mode');
+    }
   } else {
-    await env.DB.prepare('UPDATE artifacts SET public_id = ?, updated_at = ? WHERE id = ?').bind(publicId, now(), a.id).run();
+    await env.DB.prepare('UPDATE artifacts SET public_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').bind(publicId, now(), a.id).run();
   }
   return requireArtifact(env, a.id);
 }
@@ -219,13 +227,10 @@ export async function deletePrefix(env: Env, prefix: string): Promise<void> {
 }
 
 /**
- * Deletes an old version unless it is (or just became) the live one. The version row goes first, guarded
- * against current_version in the same statement: once it's gone, a rollback to it fails with 404 instead of
- * pointing current_version at files being deleted. Returns false when the version was live and kept.
+ * Claims an old version before purging its files. The claim prevents a concurrent rollback from activating
+ * it and lets cleanup retry a failed purge. The retired row continues to reserve the version number.
  */
 export async function retireVersion(env: Env, id: string, version: number): Promise<boolean> {
-  // 'retiring' first (guarded against the live version): it can no longer be activated, and if purging fails
-  // the row is still there for the daily cleanup to retry. The row goes only after its files are gone.
   const res = await env.DB.prepare(
     "UPDATE artifact_versions SET status = 'retiring' WHERE artifact_id = ?1 AND version = ?2 AND status IN ('ready', 'retiring') AND version IS NOT (SELECT current_version FROM artifacts WHERE id = ?1)",
   )
@@ -233,7 +238,7 @@ export async function retireVersion(env: Env, id: string, version: number): Prom
     .run();
   if (!res.meta.changes) return false;
   await purgeVersionFiles(env, id, version);
-  await env.DB.prepare("DELETE FROM artifact_versions WHERE artifact_id = ? AND version = ? AND status = 'retiring'").bind(id, version).run();
+  await env.DB.prepare("UPDATE artifact_versions SET status = 'retired' WHERE artifact_id = ? AND version = ? AND status = 'retiring'").bind(id, version).run();
   return true;
 }
 
@@ -262,14 +267,6 @@ export async function beginUpload(
   for (let attempt = 0; attempt < 5; attempt++) {
     const row = await env.DB.prepare('SELECT COALESCE(MAX(version), 0) AS v FROM artifact_versions WHERE artifact_id = ?').bind(artifactId).first<{ v: number }>();
     const version = (row?.v ?? 0) + 1;
-    try {
-      await env.DB.prepare('INSERT INTO artifact_versions (artifact_id, version, status, created_at, created_by) VALUES (?, ?, ?, ?, ?)')
-        .bind(artifactId, version, 'uploading', t, opts.createdBy)
-        .run();
-    } catch (e) {
-      if (String(e).includes('UNIQUE')) continue; // concurrent upload took this version number
-      throw e;
-    }
     const upload: UploadRow = {
       id: randomBase62(24),
       artifact_id: artifactId,
@@ -281,9 +278,24 @@ export async function beginUpload(
       created_at: t,
       expires_at: t + UPLOAD_TTL_SEC,
     };
-    await env.DB.prepare('INSERT INTO uploads (id, artifact_id, version, is_new, meta, expected, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .bind(upload.id, upload.artifact_id, upload.version, upload.is_new, upload.meta, upload.expected, upload.created_by, upload.created_at, upload.expires_at)
-      .run();
+    // Both rows are created together, and deletion can close the artifact before allocation.
+    const active = 'EXISTS (SELECT 1 FROM artifacts WHERE id = ?3 AND deleted_at IS NULL)';
+    try {
+      const [allocated] = await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO artifact_versions (version, status, artifact_id, created_at, created_by)
+           SELECT ?1, ?2, ?3, ?4, ?5 WHERE ?6 OR ${active}`,
+        ).bind(version, 'uploading', artifactId, t, opts.createdBy, upload.is_new),
+        env.DB.prepare(
+          `INSERT INTO uploads (id, version, artifact_id, is_new, meta, expected, created_by, created_at, expires_at)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 WHERE ?4 OR ${active}`,
+        ).bind(upload.id, version, artifactId, upload.is_new, upload.meta, upload.expected, upload.created_by, t, upload.expires_at),
+      ]);
+      if (!allocated.meta.changes) throw new HttpError(404, 'not_found', 'Artifact not found');
+    } catch (e) {
+      if (String(e).includes('UNIQUE')) continue;
+      throw e;
+    }
     return upload;
   }
   throw new HttpError(409, 'conflict', 'Could not allocate a version number, retry');
@@ -305,86 +317,76 @@ export async function putUploadFile(env: Env, upload: UploadRow, rawPath: string
     if (body instanceof ReadableStream) await body.cancel();
     return { path, size: 0, ignored: true };
   }
-  if (declaredSize != null && declaredSize > settings.max_file_bytes) throw new HttpError(413, 'file_too_large', `${path} exceeds ${settings.max_file_bytes} bytes`);
+  const size = typeof body === 'string' ? new TextEncoder().encode(body).byteLength
+    : body instanceof Blob ? body.size
+    : body instanceof ReadableStream ? declaredSize
+    : body.byteLength;
+  if (size == null || !Number.isSafeInteger(size) || size < 0) throw new HttpError(400, 'invalid_size', 'File size is required');
+  if (size > settings.max_file_bytes) throw new HttpError(413, 'file_too_large', `${path} exceeds ${settings.max_file_bytes} bytes`);
 
-  // A published (or aborted) version is immutable: refuse before touching R2.
-  // One round trip: is the version still open, and does this path already exist in it?
-  const state = await env.DB.prepare(
-    'SELECT v.status, EXISTS (SELECT 1 FROM artifact_files f WHERE f.artifact_id = v.artifact_id AND f.version = v.version AND f.path = ?) AS known FROM artifact_versions v WHERE v.artifact_id = ? AND v.version = ?',
-  )
-    .bind(path, upload.artifact_id, upload.version)
-    .first<{ status: string; known: number }>();
-  if (state?.status !== 'uploading') throw new HttpError(409, 'upload_closed', 'This upload was already committed or aborted');
-
-  // File-count limit with O(1) reads per file: a PK lookup for "new path?" plus a guarded counter increment
-  // on the upload row (no COUNT(*) over the whole version for every file).
-  const known = !!state.known;
-  let slotTaken = false;
-  const releaseSlot = async () => {
-    if (!slotTaken) return;
-    slotTaken = false;
-    await env.DB.prepare('UPDATE uploads SET file_count = MAX(file_count - 1, 0) WHERE id = ?').bind(upload.id).run();
-  };
-  if (!known) {
-    const slot = await env.DB.prepare('UPDATE uploads SET file_count = file_count + 1 WHERE id = ? AND file_count < ? RETURNING file_count')
-      .bind(upload.id, settings.max_version_files)
-      .first();
-    if (!slot) {
-      const exists = await env.DB.prepare('SELECT 1 FROM uploads WHERE id = ?').bind(upload.id).first();
-      if (!exists) throw new HttpError(404, 'upload_not_found', 'Upload session was aborted');
-      throw new HttpError(413, 'too_many_files', `At most ${settings.max_version_files} files per version`);
+  // Reserve this path before writing its object. Publishing checks the same reservations in D1.
+  const claim = await env.DB.prepare(
+    `INSERT OR IGNORE INTO upload_writes (upload_id, path)
+     SELECT u.id, ?2 FROM uploads u WHERE u.id = ?1 AND u.expires_at > ?3
+       AND (EXISTS (SELECT 1 FROM artifact_files WHERE artifact_id = u.artifact_id AND version = u.version AND path = ?2)
+         OR u.file_count < ?4)`,
+  ).bind(upload.id, path, now(), settings.max_version_files).run();
+  if (!claim.meta.changes) {
+    if (!(await env.DB.prepare('SELECT 1 FROM uploads WHERE id = ? AND expires_at > ?').bind(upload.id, now()).first())) {
+      throw new HttpError(409, 'upload_closed', 'This upload was already committed, aborted or expired');
     }
-    slotTaken = true;
+    if (await env.DB.prepare('SELECT 1 FROM upload_writes WHERE upload_id = ? AND path = ?').bind(upload.id, path).first()) {
+      throw new HttpError(409, 'file_busy', 'Another write is in progress for this path');
+    }
+    throw new HttpError(413, 'too_many_files', `At most ${settings.max_version_files} files per version`);
   }
 
   const key = r2Key(upload.artifact_id, upload.version, path);
   const contentType = contentTypeFor(path);
-  let obj: R2Object | null;
+  let stored = false;
   try {
-    obj = await env.BUCKET.put(key, body, { httpMetadata: { contentType } });
+    const obj = await env.BUCKET.put(key, body, { httpMetadata: { contentType } });
     if (!obj) throw new HttpError(500, 'storage_error', 'Failed to store file');
-    if (obj.size > settings.max_file_bytes) {
+    stored = true;
+    if (obj.size !== size) throw new HttpError(400, 'invalid_size', 'Stored file size differs from the request size');
+    const [registered] = await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO artifact_files (artifact_id, version, path, size, content_type)
+         SELECT artifact_id, version, ?2, ?3, ?4 FROM uploads WHERE id = ?1
+         ON CONFLICT (artifact_id, version, path) DO UPDATE SET size = excluded.size, content_type = excluded.content_type`,
+      ).bind(upload.id, path, obj.size, contentType),
+      env.DB.prepare('UPDATE uploads SET revision = revision + 1 WHERE id = ?').bind(upload.id),
+      env.DB.prepare('DELETE FROM upload_writes WHERE upload_id = ? AND path = ?').bind(upload.id, path),
+    ]);
+    if (!registered.meta.changes) {
       await env.BUCKET.delete(key);
-      throw new HttpError(413, 'file_too_large', `${path} exceeds ${settings.max_file_bytes} bytes`);
+      throw new HttpError(404, 'upload_not_found', 'Upload session was aborted');
     }
+    return { path, size: obj.size };
   } catch (e) {
-    await releaseSlot(); // a failed write (or a retry later) must not use up the file limit
+    // Once R2 has accepted a write, keep the reservation if its metadata transaction fails.
+    // A commit must not publish an object with stale metadata. The upload can still be aborted.
+    if (!stored) await env.DB.prepare('DELETE FROM upload_writes WHERE upload_id = ? AND path = ?').bind(upload.id, path).run();
     throw e;
   }
-  // INSERT OR IGNORE tells a new path from an existing one: if a parallel PUT of the same path got there
-  // first, give our slot back so one path never counts twice.
-  const ins = await env.DB.prepare('INSERT OR IGNORE INTO artifact_files (artifact_id, version, path, size, content_type) VALUES (?, ?, ?, ?, ?)')
-    .bind(upload.artifact_id, upload.version, path, obj.size, contentType)
-    .run();
-  if (!ins.meta.changes) {
-    await releaseSlot();
-    await env.DB.prepare('UPDATE artifact_files SET size = ?, content_type = ? WHERE artifact_id = ? AND version = ? AND path = ?')
-      .bind(obj.size, contentType, upload.artifact_id, upload.version, path)
-      .run();
-  }
-  // The session may have been committed or aborted while this file was in flight (after the check above).
-  const alive = await env.DB.prepare('SELECT 1 FROM uploads WHERE id = ?').bind(upload.id).first();
-  if (!alive) {
-    const committed = await env.DB.prepare("SELECT 1 FROM artifact_versions WHERE artifact_id = ? AND version = ? AND status = 'ready'").bind(upload.artifact_id, upload.version).first();
-    // Committed while this file was in flight: never delete from a published version — the commit may have
-    // listed this very file (its row can land before the commit reads the file list). At worst the version
-    // has one extra file not counted in its stats. Aborted: remove what we wrote.
-    if (!committed) {
-      await env.BUCKET.delete(key);
-      await env.DB.prepare('DELETE FROM artifact_files WHERE artifact_id = ? AND version = ? AND path = ?').bind(upload.artifact_id, upload.version, path).run();
-    }
-    throw committed ? new HttpError(409, 'upload_closed', 'This upload was already committed') : new HttpError(404, 'upload_not_found', 'Upload session was aborted');
-  }
-  return { path, size: obj.size };
 }
 
-/** SQL guard: the upload session still exists (bind its id). A D1 batch is one transaction, so commit and abort can't both win. */
-const PENDING = 'EXISTS (SELECT 1 FROM uploads WHERE id = ?)';
+/** The preceding statement validated the file snapshot and marked this upload's version ready. */
+const COMMIT_READY = `EXISTS (
+  SELECT 1 FROM uploads u JOIN artifact_versions v ON v.artifact_id = u.artifact_id AND v.version = u.version
+  WHERE u.id = ? AND v.status = 'ready'
+)`;
 
 export async function commitUpload(env: Env, upload: UploadRow, settings: Settings): Promise<ArtifactRow> {
-  const { results: files } = await env.DB.prepare('SELECT path, size FROM artifact_files WHERE artifact_id = ? AND version = ?')
-    .bind(upload.artifact_id, upload.version)
-    .all<{ path: string; size: number }>();
+  const [session, snapshot] = await env.DB.batch<{ revision: number; busy: number } | { path: string; size: number }>([
+    env.DB.prepare('SELECT revision, EXISTS (SELECT 1 FROM upload_writes WHERE upload_id = uploads.id) AS busy FROM uploads WHERE id = ? AND expires_at > ?')
+      .bind(upload.id, now()),
+    env.DB.prepare('SELECT path, size FROM artifact_files WHERE artifact_id = ? AND version = ?').bind(upload.artifact_id, upload.version),
+  ]);
+  const state = session.results[0] as { revision: number; busy: number } | undefined;
+  if (!state) throw new HttpError(404, 'upload_not_found', 'Upload session was aborted or expired');
+  if (state.busy) throw new HttpError(409, 'upload_busy', 'File writes are still in progress');
+  const files = snapshot.results as { path: string; size: number }[];
   if (files.length === 0) throw new HttpError(400, 'empty_upload', 'No files were uploaded');
   if (files.length > settings.max_version_files) throw new HttpError(413, 'too_many_files', `At most ${settings.max_version_files} files per version`);
   const paths = files.map((f) => f.path);
@@ -414,8 +416,11 @@ export async function commitUpload(env: Env, upload: UploadRow, settings: Settin
   const t = now();
   const stmts: D1PreparedStatement[] = [
     env.DB.prepare(
-      `UPDATE artifact_versions SET status = 'ready', file_count = ?, total_size = ?, entry = ?, kind = ? WHERE artifact_id = ? AND version = ? AND status = 'uploading' AND ${PENDING}`,
-    ).bind(files.length, totalSize, entry, kind, upload.artifact_id, upload.version, upload.id),
+      `UPDATE artifact_versions SET status = 'ready', file_count = ?, total_size = ?, entry = ?, kind = ? WHERE artifact_id = ? AND version = ? AND status = 'uploading' AND EXISTS (
+        SELECT 1 FROM uploads u WHERE u.id = ? AND u.revision = ? AND u.expires_at > ?
+          AND NOT EXISTS (SELECT 1 FROM upload_writes WHERE upload_id = u.id)
+      )`,
+    ).bind(files.length, totalSize, entry, kind, upload.artifact_id, upload.version, upload.id, state.revision, t),
   ];
 
   if (!existing) {
@@ -426,7 +431,7 @@ export async function commitUpload(env: Env, upload: UploadRow, settings: Settin
     stmts.push(
       env.DB.prepare(
         `INSERT INTO artifacts (id, public_id, title, kind, visibility, password_enc, password_ver, indexable, entry, spa_fallback, current_version, created_at, updated_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${PENDING}`,
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${COMMIT_READY}`,
       ).bind(
         upload.artifact_id,
         upload.artifact_id,
@@ -445,20 +450,25 @@ export async function commitUpload(env: Env, upload: UploadRow, settings: Settin
       ),
     );
   } else {
-    const metaSql = await metaChanges(env, existing, { title: meta.title, visibility: meta.visibility, spa_fallback: meta.spa_fallback, indexable: meta.indexable });
+    const metaSql = await metaChanges(env, { title: meta.title, visibility: meta.visibility, spa_fallback: meta.spa_fallback, indexable: meta.indexable });
     stmts.push(
       // Only go live if newer: with concurrent uploads, an older version finishing last must not roll back.
       // Metadata sent with the content (title, visibility, ...) goes live in the *same* statement as the new
       // version — never new content under the old visibility, even briefly.
       env.DB.prepare(
-        `UPDATE artifacts SET current_version = ?, kind = ?, entry = ?, updated_at = ?${metaSql.sets.map((x) => `, ${x}`).join('')} WHERE id = ? AND (current_version IS NULL OR current_version < ?) AND ${PENDING}`,
+        `UPDATE artifacts SET current_version = ?, kind = ?, entry = ?, updated_at = ?${metaSql.sets.map((x) => `, ${x}`).join('')} WHERE id = ? AND deleted_at IS NULL AND (current_version IS NULL OR current_version < ?) AND ${COMMIT_READY}`,
       ).bind(upload.version, kind, entry, t, ...metaSql.binds, upload.artifact_id, upload.version, upload.id),
     );
   }
   // Last: consuming the upload row is what makes the commit "win" against a concurrent abort.
-  stmts.push(env.DB.prepare('DELETE FROM uploads WHERE id = ?').bind(upload.id));
+  stmts.push(env.DB.prepare(`DELETE FROM uploads WHERE id = ? AND ${COMMIT_READY}`).bind(upload.id, upload.id));
   const results = await env.DB.batch(stmts);
-  if (!results[results.length - 1].meta.changes) throw new HttpError(404, 'upload_not_found', 'Upload session was aborted');
+  if (!results[0].meta.changes) {
+    if (!(await env.DB.prepare('SELECT 1 FROM uploads WHERE id = ? AND expires_at > ?').bind(upload.id, now()).first())) {
+      throw new HttpError(404, 'upload_not_found', 'Upload session was aborted or expired');
+    }
+    throw new HttpError(409, 'upload_busy', 'Files changed during commit; retry');
+  }
   // The upload is stored (as a version in history) but a newer version is already live: the content and the
   // metadata sent with it did not take effect — say so instead of answering with the other version.
   if (existing && !results[1].meta.changes) {

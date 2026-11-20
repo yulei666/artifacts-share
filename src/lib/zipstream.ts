@@ -1,4 +1,4 @@
-import { Zip, ZipDeflate, ZipPassThrough } from 'fflate';
+import { ZipWriter } from '@zip.js/zip.js/lib/zip-core-custom.js';
 import type { Env } from '../env';
 import { r2Key } from './store';
 
@@ -11,56 +11,27 @@ export interface ZipFile {
   content_type: string;
 }
 
-/**
- * Streams a ZIP of one artifact version straight from R2: files are read one at a time and fed through
- * fflate's streaming Zip, so memory stays flat regardless of the archive size. Text is deflated; already
- * compressed media is stored as-is. Backpressure: we wait for the client before pulling more from R2.
- */
+/** Streams one version from R2, using ZIP64 when the archive outgrows classic ZIP offsets. */
 export function streamZip(env: Env, ctx: { waitUntil(p: Promise<unknown>): void }, artifactId: string, version: number, files: ZipFile[], mtime: Date): ReadableStream<Uint8Array> {
-  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-  const writer = writable.getWriter();
-  writer.closed.catch(() => {}); // rejects when we abort on failure; that's handled below, not an unhandled error
-  let failed = false;
-
-  const zip = new Zip((err, chunk, final) => {
-    if (failed) return;
-    if (err) {
-      failed = true;
-      writer.abort(err).catch(() => {});
-      return;
-    }
-    writer.write(chunk).catch(() => {});
-    if (final) writer.close().catch(() => {});
+  let output: TransformStreamDefaultController<Uint8Array>;
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>({
+    start(controller) {
+      output = controller;
+    },
   });
-
-  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  const zip = new ZipWriter(writable, { useWebWorkers: false, useCompressionStream: true });
   const produce = async () => {
     try {
       for (const f of files) {
-        if (failed) return;
-        // A listed file with no object means the version is damaged: fail the download rather than
-        // silently shipping an empty file inside an otherwise "complete" ZIP.
         const obj = await env.BUCKET.get(r2Key(artifactId, version, f.path));
         if (!obj) throw new Error(`missing object for ${f.path}`);
-        const entry = COMPRESSIBLE.test(f.content_type) && f.size <= MAX_DEFLATE_BYTES ? new ZipDeflate(f.path, { level: 6 }) : new ZipPassThrough(f.path);
-        entry.mtime = mtime;
-        zip.add(entry);
-        reader = obj.body.getReader();
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          await writer.ready; // backpressure from the client (rejects if the client went away)
-          entry.push(value);
-        }
-        reader = null;
-        entry.push(new Uint8Array(0), true);
+        const level = COMPRESSIBLE.test(f.content_type) && f.size <= MAX_DEFLATE_BYTES ? 6 : 0;
+        await zip.add(f.path, { readable: obj.body, size: obj.size }, { level, lastModDate: mtime });
       }
-      zip.end();
+      await zip.close();
     } catch (e) {
-      failed = true;
       console.error('zip stream failed', artifactId, version, e);
-      await reader?.cancel().catch(() => {}); // release the R2 stream (e.g. client disconnected)
-      writer.abort(e).catch(() => {});
+      output.error(e);
     }
   };
   ctx.waitUntil(produce());

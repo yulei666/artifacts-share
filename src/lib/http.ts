@@ -84,33 +84,35 @@ export async function readBodyLimited(req: Request, max: number, code = 'file_to
   if (declared !== null && Number(declared) > max) throw new HttpError(413, code, `Body exceeds ${max} bytes`);
   if (!req.body) return new Uint8Array(0);
   const reader = req.body.getReader();
-  const chunks: Uint8Array[] = [];
+  // Resize a single buffer as chunks arrive. Keeping chunks and assembling a second full copy
+  // would use twice the upload limit in memory.
+  const buffer = new ArrayBuffer(Math.min(64 * 1024, max), { maxByteLength: max });
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > max) {
-      await reader.cancel();
-      throw new HttpError(413, code, `Body exceeds ${max} bytes`);
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const end = total + value.byteLength;
+      if (end > max) {
+        await reader.cancel();
+        throw new HttpError(413, code, `Body exceeds ${max} bytes`);
+      }
+      if (end > buffer.byteLength) buffer.resize(Math.min(max, Math.max(end, buffer.byteLength * 2)));
+      new Uint8Array(buffer, total, value.byteLength).set(value);
+      total = end;
     }
-    chunks.push(value);
+  } finally {
+    reader.releaseLock();
   }
-  const out = new Uint8Array(total);
-  let o = 0;
-  for (const c of chunks) {
-    out.set(c, o);
-    o += c.byteLength;
-  }
-  return out;
+  return new Uint8Array(buffer.transferToFixedLength(total));
 }
 
 /**
  * Request body as a JSON object. Malformed JSON, or JSON that isn't an object (`null`, arrays, numbers), is a
  * 400 `invalid_json`. `optional`: an empty body reads as `{}` (for endpoints whose body is all-optional).
  */
-export async function readJsonObject<T = Record<string, unknown>>(req: Request, opts: { optional?: boolean } = {}): Promise<T> {
-  const text = await req.text();
+export async function readJsonObject<T = Record<string, unknown>>(req: Request, opts: { optional?: boolean; maxBytes?: number } = {}): Promise<T> {
+  const text = new TextDecoder().decode(await readBodyLimited(req, opts.maxBytes ?? 1024 * 1024, 'request_too_large'));
   if (!text.trim() && opts.optional) return {} as T;
   let body: unknown;
   try {

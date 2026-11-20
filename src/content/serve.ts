@@ -4,6 +4,7 @@ import { requestPathToKey } from '../lib/paths';
 import { localPath } from '../lib/http';
 import { r2Key } from '../lib/store';
 
+const PUBLIC_BROWSER_CACHE = 'private, max-age=0, must-revalidate';
 const EDGE_CACHE_MAX_BYTES = 5 * 1024 * 1024;
 
 function baseHeaders(a: ArtifactRow, isPublic: boolean, ancestors: string): Headers {
@@ -13,8 +14,8 @@ function baseHeaders(a: ArtifactRow, isPublic: boolean, ancestors: string): Head
     'x-content-type-options': 'nosniff',
     'referrer-policy': 'strict-origin-when-cross-origin',
     // Browsers revalidate every load (cheap 304 via ETag), so making an artifact private takes effect at once;
-    // the edge copy (s-maxage) is only consulted after the gateway's access check.
-    'cache-control': isPublic ? 'public, max-age=0, must-revalidate, s-maxage=60' : 'private, no-store',
+    // shared caches must go through the gateway; its internal Cache API copy has separate headers.
+    'cache-control': isPublic ? PUBLIC_BROWSER_CACHE : 'private, no-store',
   });
   if (!(isPublic && a.indexable)) h.set('x-robots-tag', 'noindex, nofollow, noarchive');
   return h;
@@ -35,18 +36,21 @@ function rangeHeader(range: R2Range, size: number): string {
   return `bytes ${start}-${end}/${size}`;
 }
 
-function failsStrictPrecondition(req: Request, obj: R2Object): boolean {
+function matchesEtag(value: string, etag: string | null, weak = false): boolean {
+  return value.trim() === '*' || value.split(',').some((tag) => {
+    const trimmed = tag.trim();
+    return (weak ? trimmed.replace(/^W\//, '') : trimmed) === etag;
+  });
+}
+
+function preconditionStatus(req: Request, obj: R2Object): 304 | 412 | null {
+  const modified = Math.floor(obj.uploaded.getTime() / 1000);
+  const date = (name: string) => Math.floor(Date.parse(req.headers.get(name) ?? '') / 1000);
   const ifMatch = req.headers.get('if-match');
-  if (ifMatch && ifMatch.trim() !== '*') {
-    const tags = ifMatch.split(',').map((t) => t.trim().replace(/^W\//, ''));
-    if (!tags.includes(obj.httpEtag)) return true;
-  }
-  const ius = req.headers.get('if-unmodified-since');
-  if (!ifMatch && ius) {
-    const since = Date.parse(ius);
-    if (!Number.isNaN(since) && Math.floor(obj.uploaded.getTime() / 1000) > Math.floor(since / 1000)) return true;
-  }
-  return false;
+  if (ifMatch ? !matchesEtag(ifMatch, obj.httpEtag) : modified > date('if-unmodified-since')) return 412;
+  const ifNoneMatch = req.headers.get('if-none-match');
+  if (ifNoneMatch ? matchesEtag(ifNoneMatch, obj.httpEtag, true) : modified <= date('if-modified-since')) return 304;
+  return null;
 }
 
 function plain(status: number, text: string, a: ArtifactRow, ancestors: string): Response {
@@ -85,29 +89,46 @@ export async function serveFile(
     }
   };
 
-  const cacheable = isPublic && req.method === 'GET' && !req.headers.has('range');
+  const conditional = ['if-match', 'if-unmodified-since', 'if-modified-since', 'if-range'].some((name) => req.headers.has(name));
+  const cacheable = isPublic && req.method === 'GET' && !req.headers.has('range') && !conditional;
   // `indexable` changes response headers, so it is part of the key.
   const cacheKey = new Request(`${url.origin}/__cache/v${version}/i${a.indexable}/${path.split('/').map(encodeURIComponent).join('/')}`);
   if (cacheable) {
     const hit = await caches.default.match(cacheKey);
     if (hit) {
       const inm = req.headers.get('if-none-match');
-      if (inm && inm === hit.headers.get('etag')) {
+      const headers = new Headers(hit.headers);
+      headers.set('cache-control', PUBLIC_BROWSER_CACHE);
+      const etag = headers.get('etag');
+      if (inm && matchesEtag(inm, etag, true)) {
         await hit.body?.cancel();
-        return new Response(null, { status: 304, headers: hit.headers });
+        return new Response(null, { status: 304, headers });
       }
       if (isHtmlPath(path)) countView();
-      return hit;
+      return new Response(hit.body, { status: hit.status, headers });
     }
   }
 
+  let rangeApplied = false;
+  const load = async (file: string, allowRange: boolean): Promise<R2Object | R2ObjectBody | null> => {
+    const objectKey = r2Key(a.id, version, file);
+    if (isHead) return env.BUCKET.head(objectKey);
+    let range: Headers | undefined = allowRange && req.headers.has('range') ? req.headers : undefined;
+    const ifRange = req.headers.get('if-range');
+    if (range && ifRange) {
+      const current = await env.BUCKET.head(objectKey);
+      if (!current) return null;
+      // Only an ETag is a strong validator here: publishing another version can happen in the same second.
+      if (ifRange !== current.httpEtag) range = undefined;
+    }
+    rangeApplied = range !== undefined;
+    return env.BUCKET.get(objectKey, { range });
+  };
   let obj: R2Object | R2ObjectBody | null;
   try {
-    // HEAD only needs metadata; get() would open the whole object body.
-    obj = isHead ? await env.BUCKET.head(r2Key(a.id, version, path)) : await env.BUCKET.get(r2Key(a.id, version, path), { range: req.headers, onlyIf: req.headers });
+    obj = await load(path, true);
   } catch (e) {
-    // R2 rejects an unsatisfiable Range; anything else is a real storage error, not the client's fault.
-    if (req.headers.has('range')) return plain(416, 'Range not satisfiable', a, ancestors);
+    if (req.headers.has('range') && (e instanceof Error && /range|satisfiable/i.test(e.message))) return plain(416, 'Range not satisfiable', a, ancestors);
     console.error('R2 read failed', a.id, path, e);
     return plain(500, 'Storage error', a, ancestors);
   }
@@ -120,10 +141,10 @@ export async function serveFile(
     }
     const wantsHtml = (req.headers.get('accept') ?? '').includes('text/html') || !/\.[a-z0-9]+$/i.test(path);
     if (a.spa_fallback && wantsHtml) {
-      obj = isHead ? await env.BUCKET.head(r2Key(a.id, version, a.entry)) : await env.BUCKET.get(r2Key(a.id, version, a.entry));
+      obj = await load(a.entry, true);
       servedPath = a.entry;
     } else {
-      obj = isHead ? await env.BUCKET.head(r2Key(a.id, version, '404.html')) : await env.BUCKET.get(r2Key(a.id, version, '404.html'));
+      obj = await load('404.html', false);
       servedPath = '404.html';
       status = 404;
     }
@@ -133,20 +154,21 @@ export async function serveFile(
   const headers = baseHeaders(a, isPublic, ancestors);
   obj.writeHttpMetadata(headers);
   headers.set('etag', obj.httpEtag);
+  headers.set('last-modified', obj.uploaded.toUTCString());
   headers.set('accept-ranges', 'bytes');
 
+  if (status === 200) {
+    const precondition = preconditionStatus(req, obj);
+    if (precondition) {
+      if ('body' in obj) await obj.body.cancel();
+      return new Response(null, { status: precondition, headers });
+    }
+  }
   if (isHead) {
-    const inm = req.headers.get('if-none-match');
     headers.set('content-length', String(obj.size));
-    return new Response(null, { status: inm && inm === obj.httpEtag ? 304 : status, headers });
+    return new Response(null, { status, headers });
   }
-  if (!('body' in obj)) {
-    // A precondition failed. RFC 9110 evaluates If-Match / If-Unmodified-Since first (→ 412), then
-    // If-None-Match / If-Modified-Since (→ 304); check the former ourselves to tell which one it was.
-    return new Response(null, { status: failsStrictPrecondition(req, obj) ? 412 : 304, headers });
-  }
-
-  if (status === 200 && req.headers.has('range') && obj.range) {
+  if (status === 200 && rangeApplied && obj.range) {
     status = 206;
     headers.set('content-range', rangeHeader(obj.range, obj.size));
   }
@@ -155,6 +177,11 @@ export async function serveFile(
   const res = new Response((obj as R2ObjectBody).body, { status, headers });
   // Only small files go to the edge cache: clone() tees the body, and for a big file sent to a slow client the
   // runtime would buffer the difference in memory (128 MB isolate).
-  if (cacheable && status === 200 && servedPath === path && obj.size <= EDGE_CACHE_MAX_BYTES) ctx.waitUntil(caches.default.put(cacheKey, res.clone()));
+  if (cacheable && status === 200 && servedPath === path && obj.size <= EDGE_CACHE_MAX_BYTES) {
+    const cached = res.clone();
+    const cacheHeaders = new Headers(cached.headers);
+    cacheHeaders.set('cache-control', 'public, max-age=60');
+    ctx.waitUntil(caches.default.put(cacheKey, new Response(cached.body, { headers: cacheHeaders })));
+  }
   return res;
 }

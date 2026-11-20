@@ -94,7 +94,7 @@ export async function listProviders(env: Env): Promise<ProviderRow[]> {
 
 export const callbackUrl = (env: Env, ref: URL, p: Provider) => `${mainOrigin(env, ref)}/api/auth/oauth/${p}/callback`;
 
-export const canLogin = (r: ProviderRow) => !!(r.enabled && r.bound_subject && r.client_id && r.client_secret_enc);
+export const canLogin = (r: ProviderRow) => !!(r.enabled && r.bound_subject && r.client_id && r.client_secret_enc && (r.provider !== 'cloudflare' || r.issuer));
 
 /** Login methods that would remain usable; used to prevent locking the admin out. */
 export async function loginMethods(env: Env): Promise<{ password: boolean; sso: Provider[] }> {
@@ -115,7 +115,7 @@ export async function saveProvider(
   const cur = await getProvider(env, p);
   const next = { ...cur };
   if (patch.client_id !== undefined) next.client_id = patch.client_id.trim() || null;
-  if (patch.client_secret !== undefined && patch.client_secret !== '') next.client_secret_enc = await encryptString(env.SECRET_KEY, patch.client_secret.trim());
+  if (patch.client_secret?.trim()) next.client_secret_enc = await encryptString(env.SECRET_KEY, patch.client_secret.trim());
   if (patch.issuer !== undefined) {
     const iss = patch.issuer.trim().replace(/\/+$/, '');
     if (iss && !/^https:\/\/[^/\s]+\/\S*$|^https:\/\/[^/\s]+$/.test(iss)) throw new HttpError(400, 'invalid_issuer', 'Issuer must be an https URL');
@@ -132,28 +132,42 @@ export async function saveProvider(
     throw new HttpError(400, 'sso_incomplete', 'Fill in the client ID and secret (and issuer for Cloudflare) before enabling');
   }
   next.updated_at = now();
-  await env.DB.prepare(
+  const saved = await env.DB.prepare(
     `INSERT INTO sso_providers (provider, enabled, client_id, client_secret_enc, issuer, bound_subject, bound_display, bound_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(provider) DO UPDATE SET enabled = excluded.enabled, client_id = excluded.client_id, client_secret_enc = excluded.client_secret_enc,
-       issuer = excluded.issuer, bound_subject = excluded.bound_subject, bound_display = excluded.bound_display, bound_at = excluded.bound_at, updated_at = excluded.updated_at`,
+       issuer = excluded.issuer, bound_subject = excluded.bound_subject, bound_display = excluded.bound_display, bound_at = excluded.bound_at, updated_at = excluded.updated_at
+     WHERE sso_providers.enabled = ? AND sso_providers.client_id IS ? AND sso_providers.client_secret_enc IS ?
+       AND sso_providers.issuer IS ? AND sso_providers.bound_subject IS ? AND sso_providers.bound_display IS ? AND sso_providers.bound_at IS ?`,
   )
-    .bind(p, next.enabled, next.client_id, next.client_secret_enc, next.issuer, next.bound_subject, next.bound_display, next.bound_at, next.updated_at)
+    .bind(p, next.enabled, next.client_id, next.client_secret_enc, next.issuer, next.bound_subject, next.bound_display, next.bound_at, next.updated_at, cur.enabled, cur.client_id, cur.client_secret_enc, cur.issuer, cur.bound_subject, cur.bound_display, cur.bound_at)
     .run();
+  if (!saved.meta.changes) throw new HttpError(409, 'sso_config_changed', 'SSO settings changed; retry');
   return next;
 }
 
-export async function setBinding(env: Env, p: Provider, subject: string | null, display: string | null): Promise<void> {
-  await env.DB.prepare('UPDATE sso_providers SET bound_subject = ?, bound_display = ?, bound_at = ?, updated_at = ? WHERE provider = ?')
-    .bind(subject, display, subject ? now() : null, now(), p)
+type ProviderConfig = Pick<ProviderRow, 'client_id' | 'client_secret_enc' | 'issuer'>;
+
+async function configFingerprint(row: ProviderConfig) {
+  return b64url(await sha256(JSON.stringify([row.client_id, row.client_secret_enc, row.issuer])));
+}
+
+export async function setBinding(env: Env, p: Provider, subject: string | null, display: string | null, binding?: { config: ProviderConfig; sessionId: string }): Promise<void> {
+  const guard = binding
+    ? " AND client_id IS ? AND client_secret_enc IS ? AND issuer IS ? AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND method != 'bootstrap' AND expires_at > ?)"
+    : '';
+  const result = await env.DB.prepare(`UPDATE sso_providers SET bound_subject = ?, bound_display = ?, bound_at = ?, updated_at = ? WHERE provider = ?${guard}`)
+    .bind(subject, display, subject ? now() : null, now(), p,
+      ...(binding ? [binding.config.client_id, binding.config.client_secret_enc, binding.config.issuer, binding.sessionId, now()] : []))
     .run();
+  if (binding && !result.meta.changes) throw Object.assign(new HttpError(409, 'sso_config_changed', 'SSO settings or session changed; bind again'), { purpose: 'bind' });
 }
 
 // ---------- flow ----------
 
 export type Purpose = 'login' | 'bind';
 
-export async function startUrl(env: Env, ref: URL, p: Provider, purpose: Purpose, redirectTo: string): Promise<string> {
+export async function startUrl(env: Env, ref: URL, p: Provider, purpose: Purpose, redirectTo: string, sessionId?: string): Promise<string> {
   const row = await getProvider(env, p);
   if (!row.client_id || !row.client_secret_enc) throw new HttpError(400, 'sso_not_configured', `${PROVIDER_NAMES[p]} is not configured`);
   if (purpose === 'login' && !canLogin(row)) throw new HttpError(403, 'sso_unavailable', `${PROVIDER_NAMES[p]} sign-in is not enabled`);
@@ -163,8 +177,8 @@ export async function startUrl(env: Env, ref: URL, p: Provider, purpose: Purpose
   const verifier = randomToken(32);
   const challenge = b64url(await sha256(verifier));
   const nonce = ep.oidc ? randomToken(16) : null;
-  await env.DB.prepare('INSERT INTO oauth_states (state, provider, purpose, code_verifier, nonce, redirect_to, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .bind(state, p, purpose, verifier, nonce, safeRelativePath(redirectTo), now() + 600)
+  await env.DB.prepare('INSERT INTO oauth_states (state, provider, purpose, code_verifier, nonce, redirect_to, expires_at, session_id, provider_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(state, p, purpose, verifier, nonce, safeRelativePath(redirectTo), now() + 600, purpose === 'bind' ? sessionId : null, await configFingerprint(row))
     .run();
 
   const u = new URL(ep.authorize);
@@ -189,6 +203,8 @@ interface StateRow {
   nonce: string | null;
   redirect_to: string | null;
   expires_at: number;
+  session_id: string | null;
+  provider_config: string | null;
 }
 
 export interface CallbackResult {
@@ -196,14 +212,15 @@ export interface CallbackResult {
   redirectTo: string;
   subject: string;
   display: string;
+  config: ProviderConfig;
 }
 
-export async function handleCallback(env: Env, ref: URL, p: Provider): Promise<CallbackResult> {
+export async function handleCallback(env: Env, ref: URL, p: Provider, sessionId?: string): Promise<CallbackResult> {
   const state = ref.searchParams.get('state');
   const code = ref.searchParams.get('code');
   if (!state) throw new HttpError(400, 'sso_state', 'Missing state');
   // One-time use: delete and return in one statement.
-  const st = await env.DB.prepare('DELETE FROM oauth_states WHERE state = ? RETURNING *').bind(state).first<StateRow>();
+  const st = await env.DB.prepare("DELETE FROM oauth_states WHERE state = ? AND provider = ? AND (purpose = 'login' OR session_id = ?) RETURNING *").bind(state, p, sessionId ?? null).first<StateRow>();
   if (!st || st.provider !== p || st.expires_at < now()) throw new HttpError(400, 'sso_state', 'Sign-in session expired, try again');
   const base = { purpose: st.purpose, redirectTo: st.redirect_to ?? '/' };
   // From here on every failure carries the purpose, so a failed *bind* lands back in Settings (not the login
@@ -222,12 +239,15 @@ async function finishCallback(env: Env, ref: URL, p: Provider, st: StateRow, bas
   if (!code) throw Object.assign(new HttpError(400, 'sso_code', 'Missing authorization code'), base);
 
   const row = await getProvider(env, p);
+  if (st.provider_config !== await configFingerprint(row)) throw new HttpError(409, 'sso_config_changed', 'SSO settings changed; try again');
+  const config = { client_id: row.client_id, client_secret_enc: row.client_secret_enc, issuer: row.issuer };
   const secret = await decryptString(env.SECRET_KEY, row.client_secret_enc);
   if (!row.client_id || !secret) throw new HttpError(400, 'sso_not_configured', `${PROVIDER_NAMES[p]} is not configured`);
   const ep = await endpoints(row);
 
   const tokenRes = await fetch(ep.token, {
     method: 'POST',
+    redirect: 'error',
     headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
     body: new URLSearchParams({
       grant_type: 'authorization_code',
@@ -249,7 +269,7 @@ async function finishCallback(env: Env, ref: URL, p: Provider, st: StateRow, bas
     if (p === 'google' && !(claims.email_verified === true || claims.email_verified === 'true')) {
       throw Object.assign(new HttpError(400, 'sso_unverified', 'Google account email is not verified'), base);
     }
-    return { ...base, subject: claims.sub, display: claims.email ?? claims.name ?? claims.sub };
+    return { ...base, config, subject: claims.sub, display: claims.email ?? claims.name ?? claims.sub };
   }
 
   // GitHub: fetch the user; the numeric id is stable across renames.
@@ -258,5 +278,5 @@ async function finishCallback(env: Env, ref: URL, p: Provider, st: StateRow, bas
   });
   if (!userRes.ok) throw Object.assign(new HttpError(400, 'sso_user', `GitHub user lookup failed (${userRes.status})`), base);
   const user = (await userRes.json()) as { id: number; login: string };
-  return { ...base, subject: String(user.id), display: user.login };
+  return { ...base, config, subject: String(user.id), display: user.login };
 }

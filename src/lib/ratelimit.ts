@@ -42,8 +42,8 @@ export async function peekAttempts(env: Env, bucket: string): Promise<AttemptSta
   return row ? { fails: row.fails, resetAt: row.reset_at } : { fails: 0, resetAt: 0 };
 }
 
-export async function refundAttempt(env: Env, bucket: string): Promise<void> {
-  await env.DB.prepare('UPDATE rate_limits SET fails = MAX(fails - 1, 0) WHERE bucket = ? AND reset_at > ?').bind(bucket, now()).run();
+export async function refundAttempt(env: Env, bucket: string, resetAt: number): Promise<void> {
+  await env.DB.prepare('UPDATE rate_limits SET fails = MAX(fails - 1, 0) WHERE bucket = ? AND reset_at = ? AND reset_at > ?').bind(bucket, resetAt, now()).run();
 }
 
 /** Seconds until the window ends (at least 1). */

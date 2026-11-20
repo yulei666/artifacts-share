@@ -232,7 +232,7 @@ api.post('/artifacts/:id/versions/:v/activate', async (c) => {
   const { entry, kind } = await versionEntryAndKind(c.env, a, version);
   // Guarded: the daily cleanup may retire this version between the check above and here.
   const res = await c.env.DB.prepare(
-    "UPDATE artifacts SET current_version = ?1, entry = ?2, kind = ?3, updated_at = ?4 WHERE id = ?5 AND EXISTS (SELECT 1 FROM artifact_versions WHERE artifact_id = ?5 AND version = ?1 AND status = 'ready')",
+    "UPDATE artifacts SET current_version = ?1, entry = ?2, kind = ?3, updated_at = ?4 WHERE id = ?5 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM artifact_versions WHERE artifact_id = ?5 AND version = ?1 AND status = 'ready')",
   )
     .bind(version, entry, kind, now(), a.id)
     .run();
@@ -279,7 +279,7 @@ api.delete('/artifacts/:id', async (c) => {
 // ---------- upload sessions ----------
 
 api.post('/uploads', async (c) => {
-  const body = await readJson<Record<string, unknown> & { artifact_id?: string; files?: unknown }>(c);
+  const body = await readJsonObject(c.req.raw, { maxBytes: 16 * 1024 * 1024 });
   let artifactId: string | undefined;
   if (body.artifact_id !== undefined && body.artifact_id !== null) {
     if (typeof body.artifact_id !== 'string' || !isUuid(body.artifact_id)) throw new HttpError(404, 'not_found', 'Artifact not found');
@@ -289,7 +289,7 @@ api.post('/uploads', async (c) => {
   if (Array.isArray(body.files)) {
     // OS junk is dropped on upload, so it doesn't count toward the limit either.
     expected = body.files.map((f) => (typeof f === 'string' ? f : String((f as { path?: unknown })?.path ?? ''))).filter((p) => !isIgnoredPath(p));
-    const settings = await getSettings(c.env);
+    const settings = await getSettings(c.env, { fresh: true });
     if (expected.length > settings.max_version_files) throw new HttpError(413, 'too_many_files', `At most ${settings.max_version_files} files per version`);
   }
   const meta = parseMeta(body);
@@ -299,7 +299,7 @@ api.post('/uploads', async (c) => {
 
 api.put('/uploads/:uid/files/*', async (c) => {
   const u = await requireUpload(c.env, c.req.param('uid'));
-  const settings = await getSettings(c.env);
+  const settings = await getSettings(c.env, { fresh: true });
   const len = c.req.header('content-length');
   const size = len !== undefined ? Number(len) : null;
   // R2 needs a known length for streams; chunked bodies are buffered, but only up to the file-size limit.
@@ -310,7 +310,7 @@ api.put('/uploads/:uid/files/*', async (c) => {
 
 api.post('/uploads/:uid/commit', async (c) => {
   const u = await requireUpload(c.env, c.req.param('uid'));
-  const a = await commitUpload(c.env, u, await getSettings(c.env));
+  const a = await commitUpload(c.env, u, await getSettings(c.env, { fresh: true }));
   return c.json(await view(c, a), u.is_new ? 201 : 200);
 });
 

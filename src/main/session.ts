@@ -1,7 +1,6 @@
 import type { Context, MiddlewareHandler } from 'hono';
 import type { Env } from '../env';
 import { randomToken, sha256Hex } from '../lib/crypto';
-import { forgetSessions } from '../lib/sessioncache';
 import { mainOrigin } from '../lib/hosts';
 import { clearHostCookie, clientIp, HttpError, hostCookie, now, parseCookies } from '../lib/http';
 
@@ -16,18 +15,28 @@ export type AppEnv = { Bindings: Env; Variables: { auth: Auth | null } };
 export type AppContext = Context<AppEnv>;
 type Waiter = { waitUntil(p: Promise<unknown>): void };
 
-export async function createSession(env: Env, req: Request, method: string): Promise<string> {
+export async function createSession(env: Env, req: Request, method: string, verified: { hash: string | null; username: string | null } | { subject: string; clientId: string | null; secret: string | null; issuer: string | null }): Promise<string> {
   const raw = randomToken(32);
   const t = now();
-  await env.DB.prepare('INSERT INTO sessions (id, method, created_at, expires_at, user_agent, ip) VALUES (?, ?, ?, ?, ?, ?)')
-    .bind(await sha256Hex(raw), method, t, t + SESSION_TTL, (req.headers.get('user-agent') ?? '').slice(0, 300), clientIp(req))
-    .run();
+  const password = 'hash' in verified;
+  const guard = password
+    ? `(SELECT value FROM settings WHERE key = 'admin_password_hash') IS ?
+       AND (SELECT value FROM settings WHERE key = 'admin_username') IS ?
+       AND (? IS NULL OR COALESCE((SELECT value FROM settings WHERE key = 'password_login_enabled'), 'true') != 'false')`
+    : `EXISTS (SELECT 1 FROM sso_providers WHERE provider = ? AND enabled = 1 AND bound_subject = ?
+               AND client_id IS ? AND client_secret_enc IS ? AND issuer IS ?)`;
+  const checked = password
+    ? [verified.hash, verified.username, verified.hash]
+    : [method, verified.subject, verified.clientId, verified.secret, verified.issuer];
+  const result = await env.DB.prepare(
+    `INSERT INTO sessions (id, method, created_at, expires_at, user_agent, ip) SELECT ?, ?, ?, ?, ?, ? WHERE ${guard}`,
+  ).bind(await sha256Hex(raw), method, t, t + SESSION_TTL, (req.headers.get('user-agent') ?? '').slice(0, 300), clientIp(req), ...checked).run();
+  if (!result.meta.changes) throw new HttpError(409, 'auth_config_changed', 'Sign-in settings changed; try again');
   return hostCookie('as_session', raw, SESSION_TTL);
 }
 
 export async function destroySession(env: Env, sessionId: string): Promise<string> {
   await env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(sessionId).run();
-  forgetSessions(sessionId);
   return clearHostCookie('as_session');
 }
 

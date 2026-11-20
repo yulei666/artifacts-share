@@ -1,9 +1,8 @@
 import type { ArtifactRow, Env } from '../env';
 import { signPayload, verifyPayload } from '../lib/crypto';
 import { mainOrigin } from '../lib/hosts';
-import { clearHostCookie, hostCookie, localPath, now, parseCookies, safeRelativePath } from '../lib/http';
+import { clearHostCookie, hostCookie, HttpError, localPath, now, parseCookies, readBodyLimited, safeRelativePath } from '../lib/http';
 import { type AttemptResult, captchaRequired, verifyAccessCode } from '../lib/access';
-import { sessionAlive } from '../lib/sessioncache';
 import { getArtifactByPublicId } from '../lib/store';
 import { cookiesBlockedPage, errorPage, LANG_PARAM, type MessageKey, notFoundPage, type PageCtx, resolveLang, type UnlockError, unlockPage } from './pages';
 import { serveFile } from './serve';
@@ -19,7 +18,7 @@ export interface HandoffTicket { k: 'handoff'; id: string; sid: string; exp: num
 async function isOwner(env: Env, cookies: Record<string, string>, id: string): Promise<boolean> {
   const c = await verifyPayload<OwnerClaim>(env.SECRET_KEY, cookies['__Host-as_owner']);
   if (!c || c.k !== 'owner' || c.id !== id || c.exp <= now() || typeof c.sid !== 'string') return false;
-  return sessionAlive(env, c.sid);
+  return !!(await env.DB.prepare("SELECT 1 FROM sessions WHERE id = ? AND method != 'bootstrap' AND expires_at > ?").bind(c.sid, now()).first());
 }
 
 async function isUnlocked(env: Env, cookies: Record<string, string>, a: ArtifactRow): Promise<boolean> {
@@ -40,7 +39,7 @@ function redirect(location: string, status = 302, cookies: string[] = []): Respo
 }
 
 const robotsDisallow = () =>
-  new Response('User-agent: *\nDisallow: /\n', { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'public, max-age=300' } });
+  new Response('User-agent: *\nDisallow: /\n', { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } });
 
 /** Content may only be framed by itself and the main domain's viewer page. */
 export function frameAncestors(env: Env, req: Request): string {
@@ -127,7 +126,9 @@ export async function handleContent(req: Request, env: Env, execCtx: ExecutionCo
 
   // `__lang` (viewer → gateway pages) is a reserved, double-underscore name: never handed to the artifact.
   // `pwd` is only reserved in password mode (handled above) — a public artifact may use it for itself.
-  if (url.searchParams.has(LANG_PARAM)) return redirect(returnPath(url));
+  if (url.searchParams.has(LANG_PARAM) || (a.visibility === 'password' && url.searchParams.has('pwd'))) {
+    return redirect(returnPath(url, a.visibility === 'password' ? ['pwd'] : []));
+  }
   // The owner's own previews are not views.
   return serveFile(req, env, execCtx, a, { isPublic: a.visibility === 'public' && !owner, ancestors: ctx.ancestors, countView: !owner });
 }
@@ -162,7 +163,14 @@ async function shareRoutes(req: Request, env: Env, id: string, url: URL, ctx: Pa
       if (req.method !== 'POST') return redirect('/');
       const a = await getArtifactByPublicId(env, id);
       if (!a || a.visibility !== 'password') return redirect('/', 303);
-      const form = await req.formData().catch(() => null);
+      let data: Uint8Array;
+      try {
+        data = await readBodyLimited(req, 32 * 1024, 'request_too_large');
+      } catch (e) {
+        if (!(e instanceof HttpError)) throw e;
+        return new Response('Request too large', { status: e.status, headers: { 'cache-control': 'no-store' } });
+      }
+      const form = await new Response(data, { headers: { 'content-type': req.headers.get('content-type') ?? '' } }).formData().catch(() => null);
       const code = String(form?.get('code') ?? '');
       const next = safeRelativePath(String(form?.get('next') ?? '/'));
       // The unlock form carries the viewer's language, so a failed attempt re-renders in it.

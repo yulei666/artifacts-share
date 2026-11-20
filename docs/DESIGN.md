@@ -357,7 +357,7 @@ a/{artifact_id}/v{version}/{path}
 - 所有内容响应：`X-Content-Type-Options: nosniff`、`Referrer-Policy: strict-origin-when-cross-origin`
 - **搜索收录**：除 `visibility = public 且 indexable = 1` 外，一律加 `X-Robots-Tag: noindex, nofollow, noarchive`，并拦截 `/robots.txt`
 - 不对用户 HTML 加限制性 CSP；网关自己的页面（解锁页、404）加严格 CSP
-- public：`Cache-Control: public, max-age=60`，Cache API 以 `{id}:v{ver}:{path}` 为键
+- public：浏览器可保存响应，但需在使用前重新验证。网关在验权后查询 Cache API，内部缓存副本保留 60 秒，按子域名、版本、索引设置和文件路径区分。
 - private / password：`Cache-Control: private, no-store`，不进边缘缓存
 
 ---
@@ -561,7 +561,7 @@ curl -X POST "$API/artifacts" -H "Authorization: Bearer $T" \
   - 所有者：另外返回完整的 artifact 信息，以及 `frame_url`（一次性登录票据地址）。iframe 用它先在子域名上登录，私有 / 访问码内容直接可见。
 - **工具栏**：所有人可以复制链接、在新标签页打开、登录。所有者看到一个"分享"按钮（图标显示当前权限），点开是类似 Claude 的弹出面板：三种权限选项（带图标和说明）、访问码（复制 / 重新生成）、链接与"复制链接 + 访问码"。面板在点击外部、按 Esc、点进 iframe 时关闭。工具栏上另有进入管理页、退出登录。
 - **语言统一**：分享页把自己的界面语言用保留参数 `__lang` 传给 iframe，只在 iframe 会显示网关页面时才带上（访问码页、所有者登录跳转），公开内容不会收到这个参数。访问码表单里也带着语言，输错后重新显示时语言不变。网关的所有跳转都会去掉 `__lang`，它不会传到 artifact 自己的页面。退出登录时先让 iframe 访问 `/__share/logout`，清掉子域名上的所有者 Cookie，再退出主域名会话。
-- **下载**（和 Claude Artifacts 一致）：单文件 artifact 下载该 HTML 文件，多文件 artifact 下载包含全部文件的 ZIP。接口为 `GET /s/{public_id}/download`，以附件返回，并带 `CSP: sandbox`，不会在主域名上渲染。ZIP 从 R2 逐个读取文件，流式打包（fflate），文本压缩、媒体文件原样存储，内存占用不随包大小增长。
+- **下载**（和 Claude Artifacts 一致）：单文件 artifact 下载该 HTML 文件，多文件 artifact 下载包含全部文件的 ZIP。接口为 `GET /s/{public_id}/download`，以附件返回，并带 `CSP: sandbox`，不会在主域名上渲染。ZIP 从 R2 逐个读取文件，流式打包，文本按大小选择压缩，已压缩媒体原样存储。常规 ZIP 的偏移量不够时，写入 ZIP64 偏移量。
   - 权限：所有者总是可以下载；访客需要在设置中开启"允许访客下载"（`visitor_download_enabled`，默认关闭）。私有内容只有所有者能下载。访问码模式的访客通过 `POST /api/public/artifacts/{public_id}/download-token`，用访问码换取 5 分钟有效的下载凭证（访问码不出现在下载链接里；与解锁共用限流；重新生成访问码后旧凭证失效）。
   - 工具栏：一个"下载 HTML / 下载 ZIP"按钮，提示文字显示文件名、文件数和大小（访问码访客输入访问码前看不到这些信息）。访问码访客点击后弹出访问码输入框；分享链接带 `?pwd=` 时直接下载。
 - **搜索收录**：主域名 `robots.txt` 只放行 `/s/`；分享页仍默认带 `noindex`，只有公开且允许收录的 artifact 才去掉。

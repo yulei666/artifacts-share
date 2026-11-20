@@ -29,7 +29,7 @@ export async function guardedAttempt(env: Env, req: Request, bucket: string, tur
   const att = await takeAttempt(env, bucket, max);
   if (att.limited) return { ok: false, reason: 'locked', retryAfter: retryAfter(att) };
   if (await check()) {
-    await refundAttempt(env, bucket);
+    await refundAttempt(env, bucket, att.resetAt);
     return { ok: true };
   }
   const remaining = max - att.fails;
