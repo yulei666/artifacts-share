@@ -53,10 +53,11 @@ npx wrangler r2 bucket create artifacts-share
 openssl rand -base64 48 | npx wrangler secret put SECRET_KEY
 npx wrangler secret put ADMIN_BOOTSTRAP_PASSWORD     # 首次登录用的临时密码
 
-# 3. 建表并部署
-npm run db:migrate:remote
+# 3. 建表并部署（deploy 会先执行 D1 迁移，再部署代码）
 npm run deploy
 ```
+
+> `npm run deploy` 总是先执行 `db:migrate:remote`：新代码可能依赖新的表结构，先部署代码会让上传失败。已执行过的迁移会被跳过。单独用 `wrangler deploy` 部署时，请先运行 `npm run db:migrate:remote`。
 
 4. DNS：在内容域名的 zone（例如 `example-content.com`）添加 `*` → `AAAA 100::`，**开启代理（橙色云）**。
    主域名的记录由 Custom Domain 自动创建，无需手动添加。

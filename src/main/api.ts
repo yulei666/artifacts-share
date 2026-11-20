@@ -288,7 +288,7 @@ api.post('/uploads', async (c) => {
   let expected: string[] | undefined;
   if (Array.isArray(body.files)) {
     // OS junk is dropped on upload, so it doesn't count toward the limit either.
-    expected = body.files.map((f) => (typeof f === 'string' ? f : String((f as { path?: unknown })?.path ?? ''))).filter((p) => !isIgnoredPath(p));
+    expected = [...new Set(body.files.map((f) => (typeof f === 'string' ? f : String((f as { path?: unknown })?.path ?? ''))).filter((p) => !isIgnoredPath(p)))];
     const settings = await getSettings(c.env, { fresh: true });
     if (expected.length > settings.max_version_files) throw new HttpError(413, 'too_many_files', `At most ${settings.max_version_files} files per version`);
   }
