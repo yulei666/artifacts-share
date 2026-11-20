@@ -3,7 +3,7 @@ import { VISIBILITIES } from '../env';
 import { decryptString, encryptString, randomAccessCode, randomBase62 } from './crypto';
 import { contentOrigin, mainOrigin } from './hosts';
 import { HttpError, now } from './http';
-import { contentTypeFor, isHtmlPath } from './mime';
+import { contentTypeFor, isHtmlPath, isMarkdownPath } from './mime';
 import { inferEntry, isIgnoredPath, normalizePath, stripCommonRoot } from './paths';
 import { getSettings, type Settings } from './settings';
 
@@ -15,6 +15,7 @@ export interface ArtifactMeta {
   entry?: string;
   spa_fallback?: boolean;
   indexable?: boolean;
+  source_kind?: 'folder';
 }
 
 export interface UploadRow {
@@ -33,8 +34,12 @@ export interface UploadRow {
   expires_at: number;
 }
 
-/** A single HTML file is an 'html' artifact; anything else is a 'folder' (downloads follow this). */
-export const kindOf = (paths: string[]): 'html' | 'folder' => (paths.length === 1 && isHtmlPath(paths[0]) ? 'html' : 'folder');
+/** Explicit folder uploads keep their archive format even when they contain just one file. */
+export function kindOf(paths: string[], sourceKind?: ArtifactMeta['source_kind']): ArtifactRow['kind'] {
+  if (sourceKind === 'folder' || paths.length !== 1) return 'folder';
+  if (isHtmlPath(paths[0])) return 'html';
+  return isMarkdownPath(paths[0]) ? 'markdown' : 'folder';
+}
 
 export const r2Prefix = (id: string, version?: number) => (version === undefined ? `a/${id}/` : `a/${id}/v${version}/`);
 export const r2Key = (id: string, version: number, path: string) => `${r2Prefix(id, version)}${path}`;
@@ -65,6 +70,10 @@ export function parseMeta(raw: Record<string, unknown>): ArtifactMeta {
     if (!e) throw new HttpError(400, 'invalid_meta', 'invalid entry path');
     meta.entry = e;
   }
+  if (raw.source_kind !== undefined && raw.source_kind !== null) {
+    if (raw.source_kind !== 'folder') throw new HttpError(400, 'invalid_meta', 'source_kind must be folder when specified');
+    meta.source_kind = raw.source_kind;
+  }
   const spa = parseBool(raw.spa_fallback);
   if (spa !== undefined) meta.spa_fallback = spa;
   const idx = parseBool(raw.indexable);
@@ -75,7 +84,7 @@ export function parseMeta(raw: Record<string, unknown>): ArtifactMeta {
 export function metaFromRequest(req: Request): ArtifactMeta {
   const url = new URL(req.url);
   const raw: Record<string, unknown> = {};
-  for (const k of ['title', 'visibility', 'entry', 'spa_fallback', 'indexable']) {
+  for (const k of ['title', 'visibility', 'entry', 'spa_fallback', 'indexable', 'source_kind']) {
     const q = url.searchParams.get(k);
     const h = req.headers.get(`x-artifact-${k.replace('_', '-')}`);
     const v = q ?? (h !== null ? safeDecode(h) : null);
@@ -542,9 +551,9 @@ export async function commitUpload(env: Env, upload: UploadRow, settings: Settin
   } else {
     entry = inferEntry(paths);
   }
-  if (!entry) throw new HttpError(400, 'entry_required', 'Could not determine the entry file; add index.html or pass `entry`');
+  if (!entry) throw new HttpError(400, 'entry_required', 'Could not determine the entry file; add index.html, index.md or pass `entry`');
 
-  const kind = kindOf(paths);
+  const kind = kindOf(paths, meta.source_kind);
   const totalSize = files.reduce((s, f) => s + f.size, 0);
   const t = now();
   const stmts: D1PreparedStatement[] = [
@@ -642,7 +651,7 @@ export async function versionEntryAndKind(env: Env, a: ArtifactRow, version: num
   if (!v) throw new HttpError(404, 'version_not_found', 'Version not found');
   const { results } = await env.DB.prepare('SELECT path FROM artifact_files WHERE artifact_id = ? AND version = ?').bind(a.id, version).all<{ path: string }>();
   const paths = results.map((r) => r.path);
-  const entry = paths.includes(a.entry) ? a.entry : (v.entry ?? inferEntry(paths) ?? paths.find(isHtmlPath) ?? paths[0]);
+  const entry = paths.includes(a.entry) ? a.entry : (v.entry ?? inferEntry(paths) ?? paths.find((path) => isHtmlPath(path) || isMarkdownPath(path)) ?? paths[0]);
   const kind = v.kind ?? kindOf(paths);
   return { entry, kind };
 }

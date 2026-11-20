@@ -9,12 +9,12 @@ Authenticated requests go to `<admin-origin>/api/v1` with `Authorization: Bearer
 | `GET /artifacts` | List or search. Optional `q`, `visibility`, `limit` (1–100), and `cursor`. Returns `items` and `next_cursor`. |
 | `GET /artifacts/{id}` | Read live metadata and the current access code for a password-protected artifact. |
 | `PATCH /artifacts/{id}` | Update selected fields from `title`, `visibility`, `entry`, `spa_fallback`, and `indexable`. |
-| `POST /uploads` | Start a session with `files` as an array of relative file paths, optional metadata, and optional `artifact_id` for an update. |
+| `POST /uploads` | Start a session with `files` as an array of relative file paths, optional metadata, and optional `artifact_id` for an update. Send `source_kind: "folder"` for directory or archive inputs, including single-file folders. |
 | `PUT /uploads/{upload_id}/files/{path}` | Send file bytes with a known length. Percent-encode each path segment and preserve directory separators. |
 | `POST /uploads/{upload_id}/commit` | Publish after all writes finish. Returns the artifact on success. |
 | `DELETE /uploads/{upload_id}` | Abort an unfinished session. |
 
-An upload session expires after 24 hours. The helper reads ZIP entries locally and uses one upload session, so server-side ZIP extraction can stay disabled. The server also accepts one-shot `POST /artifacts` and `PUT /artifacts/{id}/content` with raw HTML, multipart files, or a ZIP when server-side extraction is enabled. Upload limits come from server settings.
+An upload session expires after 24 hours. The helper reads ZIP entries locally and uses one upload session, so server-side ZIP extraction can stay disabled. The server also accepts one-shot `POST /artifacts` and `PUT /artifacts/{id}/content` with raw HTML or Markdown, multipart files, or a ZIP when server-side extraction is enabled. Upload limits come from server settings.
 
 ## Versions, links, and files
 
@@ -29,6 +29,8 @@ An upload session expires after 24 hours. The helper reads ZIP entries locally a
 | `DELETE /artifacts/{id}` | Remove the artifact, its versions, and files. |
 
 Perform writes, version activation, link regeneration, or deletion only when the user requests that effect. The share-page download endpoint uses owner session authentication or visitor access rules. For Bearer-authenticated automation, use the file endpoints above.
+
+Browser navigation renders `.md` and `.markdown` files on `content_url`, including files linked from a folder's entry page. Relative links and images resolve from the current file's directory. A normal `curl` request returns the Markdown source. Append `?__share_raw=1` to an authorized content file URL to request the source explicitly.
 
 ## Failures
 

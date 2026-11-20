@@ -163,7 +163,7 @@ def upload_files(source):
     raise ShareError('Choose a regular file or directory.')
   if source.is_dir():
     yield list(walk_folder(source)), ''
-  elif source.is_file() and source.suffix.lower() in ('.html', '.htm'):
+  elif source.is_file() and source.suffix.lower() in ('.html', '.htm', '.md', '.markdown'):
     yield [(validate_path(source.name), source.stat().st_size, source.open)], ''
   elif source.is_file() and source.suffix.lower() == '.zip':
     with ZipFile(source) as archive:
@@ -183,7 +183,7 @@ def upload_files(source):
         for name, size, member in files
       ], strip
   else:
-    raise ShareError(f'Choose an HTML file, a build directory, or a ZIP: {source}')
+    raise ShareError(f'Choose an HTML or Markdown file, a directory, or a ZIP: {source}')
 
 
 def metadata(args):
@@ -201,6 +201,9 @@ def publish(args):
     meta['artifact_id'] = args.artifact_id
   else:
     meta.setdefault('visibility', 'private')
+
+  if args.source.is_dir() or args.source.suffix.lower() == '.zip':
+    meta['source_kind'] = 'folder'
 
   with upload_files(args.source) as (files, strip):
     names = [name for name, _, _ in files]
@@ -263,7 +266,7 @@ def add_metadata(parser):
 def configure():
   parser = argparse.ArgumentParser(description=__doc__)
   commands = parser.add_subparsers(dest='command', required=True)
-  upload = commands.add_parser('publish', help='publish an HTML file, directory, or ZIP')
+  upload = commands.add_parser('publish', help='publish an HTML or Markdown file, directory, or ZIP')
   upload.add_argument('source', type=Path)
   upload.add_argument('--artifact-id', type=parse_artifact_id, help='publish a new version of this artifact')
   upload.add_argument('--dry-run', action='store_true', help='print the local file list without contacting the API')
