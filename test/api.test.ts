@@ -1646,7 +1646,7 @@ describe('review regressions (round 11)', () => {
     expect(act.status).toBe(404); // can't go live while retiring
     await act.arrayBuffer();
     expect(await retireVersion(env as any, a.id, 1)).toBe(true);
-    expect(await env.DB.prepare('SELECT status FROM artifact_versions WHERE artifact_id = ? AND version = 1').bind(a.id).first()).toEqual({ status: 'retired' });
+    expect(await env.DB.prepare('SELECT status FROM artifact_versions WHERE artifact_id = ? AND version = 1').bind(a.id).first()).toEqual({ status: 'purged' });
     expect(await env.BUCKET.head(`a/${a.id}/v1/index.html`)).toBeNull();
   });
 
@@ -1924,5 +1924,143 @@ describe('review regressions (loop 2, round 7)', () => {
     const stale = await env.DB.prepare('SELECT * FROM uploads WHERE id = ?').bind(up.upload_id).first<any>();
     expect((await api(`/api/v1/uploads/${up.upload_id}`, { method: 'DELETE' })).status).toBe(204);
     await expect(commitUpload(env as any, stale, await getSettings(env as any))).rejects.toMatchObject({ code: 'upload_not_found' });
+  });
+});
+
+describe('manifest cleanup follow-ups', () => {
+  const jsonHeaders = { 'content-type': 'application/json' };
+
+  it('sweeps orphan manifest rows in bounded batches and keeps live sessions', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { sweepOrphanManifests } = await import('../src/cron');
+    const live = await json(await api('/api/v1/uploads', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ files: ['a.html', 'b.html'] }) }), 201);
+    const values = Array.from({ length: 7 }, (_, i) => `('orphan-sweep', 'f${i}.html')`).join(', ');
+    await env.DB.prepare(`INSERT INTO upload_expected (upload_id, path) VALUES ${values}`).run();
+
+    // other tests may leave orphans too (shared DB), so assert on capped counts and on our own rows
+    expect(await sweepOrphanManifests(env as any, 2, 2)).toBe(4); // capped: 2 batches of 2
+    await sweepOrphanManifests(env as any, 2, 50); // later runs work off the rest of the backlog
+    expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM upload_expected WHERE upload_id = 'orphan-sweep'").first<any>()).n).toBe(0);
+    expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM upload_expected WHERE upload_id = ?').bind(live.upload_id).first<any>()).n).toBe(2);
+  });
+
+  it('does not hand out a session that was removed while its file list was written', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { beginUpload } = await import('../src/lib/store');
+    let removed = false;
+    // simulate the session vanishing (e.g. its artifact purged) right before its manifest is marked complete
+    const db = new Proxy(env.DB, {
+      get: (t, p) => {
+        if (p === 'prepare') {
+          return (sql: string) => {
+            const stmt = (t as any).prepare(sql);
+            if (!sql.startsWith('UPDATE uploads SET manifest')) return stmt;
+            return {
+              bind: (...args: any[]) => ({
+                run: async () => {
+                  await (t as any).prepare('DELETE FROM uploads WHERE id = ?').bind(args[1]).run();
+                  removed = true;
+                  return stmt.bind(...args).run();
+                },
+              }),
+            };
+          };
+        }
+        return typeof (t as any)[p] === 'function' ? (t as any)[p].bind(t) : (t as any)[p];
+      },
+    });
+    const err = await beginUpload({ ...(env as any), DB: db }, { meta: {}, expected: ['index.html', 'a.css'], createdBy: 'test' }).catch((e) => e);
+    expect(err).toMatchObject({ status: 404, code: 'not_found' }); // the artifact went away; no upload ID was handed out
+    expect(removed).toBe(true);
+    expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM upload_expected WHERE upload_id NOT IN (SELECT id FROM uploads)").first<any>()).n).toBe(0);
+  });
+});
+
+describe('retried commits', () => {
+  const jsonHeaders = { 'content-type': 'application/json' };
+  const start = async () => {
+    const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ files: ['index.html'] }) }), 201);
+    await json(await api(`/api/v1/uploads/${up.upload_id}/files/index.html`, { method: 'PUT', body: '<p>i</p>' }), 200);
+    return up;
+  };
+
+  it('answers a commit retried after success with 409 upload_closed, not 404', async () => {
+    const up = await start();
+    await json(await api(`/api/v1/uploads/${up.upload_id}/commit`, { method: 'POST' }), 201);
+    const retry = await api(`/api/v1/uploads/${up.upload_id}/commit`, { method: 'POST' }); // first response "lost"
+    expect(retry.status).toBe(409);
+    expect((await retry.json<any>()).error.code).toBe('upload_closed');
+  });
+
+  it('still answers 404 for a commit of an aborted session', async () => {
+    const up = await start();
+    expect((await api(`/api/v1/uploads/${up.upload_id}`, { method: 'DELETE' })).status).toBe(204);
+    const res = await api(`/api/v1/uploads/${up.upload_id}/commit`, { method: 'POST' });
+    expect(res.status).toBe(404);
+    expect((await res.json<any>()).error.code).toBe('upload_not_found');
+  });
+});
+
+describe('committed sessions answer upload_closed everywhere', () => {
+  const jsonHeaders = { 'content-type': 'application/json' };
+  const publish = async (artifactId?: string, body = '<p>i</p>') => {
+    const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ artifact_id: artifactId, files: ['index.html'] }) }), 201);
+    await json(await api(`/api/v1/uploads/${up.upload_id}/files/index.html`, { method: 'PUT', body }), 200);
+    const res = await api(`/api/v1/uploads/${up.upload_id}/commit`, { method: 'POST' });
+    expect([200, 201]).toContain(res.status);
+    await res.arrayBuffer();
+    return up;
+  };
+  const codeOf = async (res: Response) => ({ status: res.status, code: (await res.json<any>()).error.code });
+
+  it('for a retried file PUT or DELETE after the commit', async () => {
+    const up = await publish();
+    expect(await codeOf(await api(`/api/v1/uploads/${up.upload_id}/files/index.html`, { method: 'PUT', body: 'x' }))).toEqual({ status: 409, code: 'upload_closed' });
+    expect(await codeOf(await api(`/api/v1/uploads/${up.upload_id}`, { method: 'DELETE' }))).toEqual({ status: 409, code: 'upload_closed' });
+  });
+
+  it('for a session begun before migration 0003 (no upload_id on its version)', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { commitUpload } = await import('../src/lib/store');
+    const { getSettings } = await import('../src/lib/settings');
+    const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ files: ['index.html'] }) }), 201);
+    await json(await api(`/api/v1/uploads/${up.upload_id}/files/index.html`, { method: 'PUT', body: '<p>i</p>' }), 200);
+    const stale = await env.DB.prepare('SELECT * FROM uploads WHERE id = ?').bind(up.upload_id).first<any>();
+    await env.DB.prepare('UPDATE artifact_versions SET upload_id = NULL WHERE artifact_id = ?').bind(up.artifact_id).run(); // as old code wrote it
+    await json(await api(`/api/v1/uploads/${up.upload_id}/commit`, { method: 'POST' }), 201);
+    await expect(commitUpload(env as any, stale, await getSettings(env as any))).rejects.toMatchObject({ code: 'upload_closed' });
+  });
+
+  it('after the committed version has been retired by cleanup', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { retireVersion } = await import('../src/lib/store');
+    const first = await publish();
+    await publish(first.artifact_id, '<p>v2</p>'); // v1 is no longer live
+    expect(await retireVersion(env as any, first.artifact_id, first.version)).toBe(true);
+    expect(await codeOf(await api(`/api/v1/uploads/${first.upload_id}/commit`, { method: 'POST' }))).toEqual({ status: 409, code: 'upload_closed' });
+  });
+});
+
+describe('file writes on a session that just closed', () => {
+  it('answers 404 (not upload_closed) when the session was aborted mid-write', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { putUploadFile } = await import('../src/lib/store');
+    const { getSettings } = await import('../src/lib/settings');
+    const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ files: ['index.html'] }) }), 201);
+    const row = await env.DB.prepare('SELECT * FROM uploads WHERE id = ?').bind(up.upload_id).first<any>(); // PUT passed requireUpload…
+    expect((await api(`/api/v1/uploads/${up.upload_id}`, { method: 'DELETE' })).status).toBe(204); // …then an abort landed
+    await expect(putUploadFile(env as any, row, 'index.html', '<p>i</p>', await getSettings(env as any))).rejects.toMatchObject({ status: 404, code: 'upload_not_found' });
+  });
+});
+
+describe('error codes for deleted artifacts', () => {
+  it('answers a retried commit with 404 once the artifact is deleted', async () => {
+    const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ files: ['index.html'] }) }), 201);
+    await json(await api(`/api/v1/uploads/${up.upload_id}/files/index.html`, { method: 'PUT', body: '<p>i</p>' }), 200);
+    await json(await api(`/api/v1/uploads/${up.upload_id}/commit`, { method: 'POST' }), 201);
+    expect((await api(`/api/v1/artifacts/${up.artifact_id}`, { method: 'DELETE' })).status).toBe(204);
+    const retry = await api(`/api/v1/uploads/${up.upload_id}/commit`, { method: 'POST' });
+    expect(retry.status).toBe(404); // consistent with GET /artifacts/{id}
+    expect((await retry.json<any>()).error.code).toBe('upload_not_found');
   });
 });

@@ -234,7 +234,8 @@ export async function deletePrefix(env: Env, prefix: string): Promise<void> {
 
 /**
  * Claims an old version before purging its files. The claim prevents a concurrent rollback from activating
- * it and lets cleanup retry a failed purge. The retired row continues to reserve the version number.
+ * it and lets cleanup retry a failed purge. Once purged, the row is kept as 'purged': it still reserves the version number and still records
+ * that its upload was committed ('retired' marks aborted uploads only).
  */
 export async function retireVersion(env: Env, id: string, version: number): Promise<boolean> {
   const res = await env.DB.prepare(
@@ -244,7 +245,8 @@ export async function retireVersion(env: Env, id: string, version: number): Prom
     .run();
   if (!res.meta.changes) return false;
   await purgeVersionFiles(env, id, version);
-  await env.DB.prepare("UPDATE artifact_versions SET status = 'retired' WHERE artifact_id = ? AND version = ? AND status = 'retiring'").bind(id, version).run();
+  // 'purged' (not 'retired', which marks aborted uploads): the row keeps saying "this upload was committed".
+  await env.DB.prepare("UPDATE artifact_versions SET status = 'purged' WHERE artifact_id = ? AND version = ? AND status = 'retiring'").bind(id, version).run();
   return true;
 }
 
@@ -291,9 +293,9 @@ export async function beginUpload(
     try {
       const [allocated] = await env.DB.batch([
         env.DB.prepare(
-          `INSERT INTO artifact_versions (version, status, artifact_id, created_at, created_by)
-           SELECT ?1, ?2, ?3, ?4, ?5 WHERE ?6 OR ${active}`,
-        ).bind(version, 'uploading', artifactId, t, opts.createdBy, upload.is_new),
+          `INSERT INTO artifact_versions (version, status, artifact_id, created_at, created_by, upload_id)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?7 WHERE ?6 OR ${active}`,
+        ).bind(version, 'uploading', artifactId, t, opts.createdBy, upload.is_new, upload.id),
         env.DB.prepare(
           `INSERT INTO uploads (id, version, artifact_id, is_new, meta, expected, manifest, created_by, created_at, expires_at)
            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 WHERE ?4 OR ${active}`,
@@ -309,7 +311,14 @@ export async function beginUpload(
     if (expected?.length) {
       try {
         upload.manifest = `rows:${await insertExpected(env, upload.id, expected)}`;
-        await env.DB.prepare("UPDATE uploads SET manifest = ? WHERE id = ? AND manifest = 'pending'").bind(upload.manifest, upload.id).run();
+        const marked = await env.DB.prepare("UPDATE uploads SET manifest = ? WHERE id = ? AND manifest = 'pending'").bind(upload.manifest, upload.id).run();
+        // The session was removed while its list was being written (e.g. the artifact was deleted): don't hand
+        // out an ID that no longer works, and don't leave the rows we just wrote behind.
+        if (!marked.meta.changes) {
+          await deleteExpected(env, upload.id).catch(() => {});
+          // The client never received this upload ID; what happened is that the artifact went away.
+          throw new HttpError(404, 'not_found', 'Artifact not found');
+        }
       } catch (e) {
         await abortUpload(env, upload).catch(() => {});
         throw e;
@@ -359,7 +368,7 @@ export async function deleteExpected(env: Env, uploadId: string): Promise<void> 
 
 export async function requireUpload(env: Env, id: string): Promise<UploadRow> {
   const u = await env.DB.prepare('SELECT * FROM uploads WHERE id = ? AND expires_at > ?').bind(id, now()).first<UploadRow>();
-  if (!u) throw new HttpError(404, 'upload_not_found', 'Upload session not found or expired');
+  if (!u) throw await sessionGoneError(env, id); // committed → 409 upload_closed, for every route
   return u;
 }
 
@@ -389,7 +398,7 @@ export async function putUploadFile(env: Env, upload: UploadRow, rawPath: string
   ).bind(upload.id, path, now(), settings.max_version_files).run();
   if (!claim.meta.changes) {
     if (!(await env.DB.prepare('SELECT 1 FROM uploads WHERE id = ? AND expires_at > ?').bind(upload.id, now()).first())) {
-      throw new HttpError(409, 'upload_closed', 'This upload was already committed, aborted or expired');
+      throw await goneError(env, upload); // committed → 409 upload_closed; aborted or expired → 404
     }
     if (await env.DB.prepare('SELECT 1 FROM upload_writes WHERE upload_id = ? AND path = ?').bind(upload.id, path).first()) {
       throw new HttpError(409, 'file_busy', 'Another write is in progress for this path');
@@ -416,7 +425,7 @@ export async function putUploadFile(env: Env, upload: UploadRow, rawPath: string
     ]);
     if (!registered.meta.changes) {
       await env.BUCKET.delete(key);
-      throw new HttpError(404, 'upload_not_found', 'Upload session was aborted');
+      throw await goneError(env, upload);
     }
     return { path, size: obj.size };
   } catch (e) {
@@ -436,9 +445,39 @@ const COMMIT_READY = `EXISTS (
 /** The session was committed or aborted by a concurrent request: say which, instead of a misleading error. */
 async function throwIfSessionGone(env: Env, upload: UploadRow): Promise<void> {
   if (await env.DB.prepare('SELECT 1 FROM uploads WHERE id = ?').bind(upload.id).first()) return;
-  const v = await env.DB.prepare('SELECT status FROM artifact_versions WHERE artifact_id = ? AND version = ?').bind(upload.artifact_id, upload.version).first<{ status: string }>();
-  if (v?.status === 'ready') throw new HttpError(409, 'upload_closed', 'This upload was already committed');
-  throw new HttpError(404, 'upload_not_found', 'Upload session was aborted or expired');
+  throw await goneError(env, upload);
+}
+
+/** sessionGoneError, plus a lookup by (artifact, version) for sessions begun before migration 0003. */
+async function goneError(env: Env, upload: UploadRow): Promise<HttpError> {
+  const e = await sessionGoneError(env, upload.id);
+  if (e.code === 'upload_closed') return e;
+  const v = await env.DB.prepare(
+    `SELECT 1 FROM artifact_versions v JOIN artifacts a ON a.id = v.artifact_id AND a.deleted_at IS NULL
+     WHERE v.artifact_id = ? AND v.version = ? AND v.status IN (${COMMITTED_STATES})`,
+  )
+    .bind(upload.artifact_id, upload.version)
+    .first();
+  return v ? new HttpError(409, 'upload_closed', 'This upload was already committed') : e;
+}
+
+/** Version states that mean "its upload was committed" (published, being cleaned up, or cleaned up). */
+const COMMITTED_STATES = "'ready', 'retiring', 'purged'";
+
+/**
+ * Why an upload session no longer exists. A committed session's version stays 'ready' (or 'retiring' when
+ * old versions are being cleaned up, 'purged' after): that is 409 upload_closed — the commit already happened, e.g. a retry
+ * whose first response was lost — so clients must not upload again. Anything else is 404 upload_not_found.
+ */
+export async function sessionGoneError(env: Env, uploadId: string): Promise<HttpError> {
+  // Only while the artifact still exists: once it is deleted the answer is 404, like everything else about it.
+  const v = await env.DB.prepare(
+    `SELECT 1 FROM artifact_versions v JOIN artifacts a ON a.id = v.artifact_id AND a.deleted_at IS NULL
+     WHERE v.upload_id = ? AND v.status IN (${COMMITTED_STATES})`,
+  )
+    .bind(uploadId)
+    .first();
+  return v ? new HttpError(409, 'upload_closed', 'This upload was already committed') : new HttpError(404, 'upload_not_found', 'Upload session was aborted or expired');
 }
 
 export async function commitUpload(env: Env, upload: UploadRow, settings: Settings): Promise<ArtifactRow> {
@@ -559,7 +598,7 @@ export async function commitUpload(env: Env, upload: UploadRow, settings: Settin
   const results = await env.DB.batch(stmts);
   if (!results[0].meta.changes) {
     if (!(await env.DB.prepare('SELECT 1 FROM uploads WHERE id = ? AND expires_at > ?').bind(upload.id, now()).first())) {
-      throw new HttpError(404, 'upload_not_found', 'Upload session was aborted or expired');
+      throw await goneError(env, upload); // a concurrent commit won → upload_closed
     }
     throw new HttpError(409, 'upload_busy', 'Files changed during commit; retry');
   }
