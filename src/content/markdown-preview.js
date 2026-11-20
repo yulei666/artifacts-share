@@ -96,14 +96,26 @@ function addCopyButtons() {
     block.className = 'code-block';
     const toolbar = document.createElement('div');
     toolbar.className = 'code-toolbar';
+    const language = [...code.classList].find((name) => name.startsWith('language-'))?.slice('language-'.length);
+    if (language) {
+      const label = document.createElement('span');
+      label.className = 'code-language';
+      label.textContent = language;
+      toolbar.append(label);
+    }
     const button = document.createElement('button');
     button.type = 'button';
-    button.textContent = article.dataset.copy;
+    button.setAttribute('aria-label', article.dataset.copy);
+    button.title = article.dataset.copy;
+    const icon = document.createElement('span');
+    icon.className = 'copy-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    button.append(icon);
     button.addEventListener('click', async () => {
       const message = await copyCode(code);
       clearTimeout(announceFeedback);
       clearTimeout(clearFeedback);
-      toolbar.prepend(feedback);
+      toolbar.insertBefore(feedback, button);
       feedback.textContent = message;
       // Give assistive technology time to observe the empty region before repeating a message.
       copyStatus.textContent = '';

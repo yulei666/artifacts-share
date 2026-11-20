@@ -64,11 +64,11 @@ export function markdownObjectEtag(ifNoneMatch: string | null, lang: PageCtx['la
 const TEXT = {
   zh: {
     preview: '渲染预览', source: '源文件', loading: '正在渲染 Markdown…', error: '无法渲染 Markdown，可以切换到源文件。', tooLarge: '此 Markdown 文件过大，无法预览。',
-    copy: '复制', copied: '已复制', copySelected: '已选中代码，请手动复制。', copyFailed: '复制失败，请手动选择并复制代码。',
+    copy: '复制代码', copied: '已复制', copySelected: '已选中代码，请手动复制。', copyFailed: '复制失败，请手动选择并复制代码。',
   },
   en: {
     preview: 'Preview', source: 'Source file', loading: 'Rendering Markdown…', error: 'Unable to render Markdown. You can still view the source file.', tooLarge: 'This Markdown file is too large to preview.',
-    copy: 'Copy', copied: 'Copied', copySelected: 'Code selected. Copy it manually.', copyFailed: 'Could not copy. Select the code to copy it manually.',
+    copy: 'Copy code', copied: 'Copied', copySelected: 'Code selected. Copy it manually.', copyFailed: 'Could not copy. Select the code to copy it manually.',
   },
 };
 
