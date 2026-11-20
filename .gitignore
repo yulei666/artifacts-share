@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.dev.vars
+web/vendor/
+dist/
+wrangler.dev.toml
+wrangler.toml
+wrangler.test.toml

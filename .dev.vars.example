@@ -1,0 +1,9 @@
+SECRET_KEY=change-me-to-a-long-random-string
+ADMIN_BOOTSTRAP_PASSWORD=change-me
+# ADMIN_USERNAME=admin
+# Turnstile test keys (always pass): https://developers.cloudflare.com/turnstile/troubleshooting/testing/
+# TURNSTILE_SITE_KEY=1x00000000000000000000AA
+# TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+# Local dev: open http://share.localhost:8787 ; artifacts at http://<uuid>-share.localhost:8787
+MAIN_HOST=share.localhost
+CONTENT_ZONE=localhost
