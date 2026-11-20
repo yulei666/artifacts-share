@@ -54,11 +54,18 @@ body { margin: 0; }
 .code-block { margin: 1em 0; min-width: 0; border: 1px solid var(--line); border-radius: .65rem; background: var(--well); }
 .code-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: .65rem; padding: .45rem .65rem 0 1.1rem; color: var(--quiet); font-size: .78rem; }
 .code-language { margin-inline-end: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--code-language); font: .72rem/1.5 ui-monospace, "SF Mono", Consolas, monospace; }
-.code-toolbar button { display: grid; place-items: center; flex: none; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--code-icon); cursor: pointer; }
-.code-toolbar button:hover { background: var(--paper); color: var(--ink); }
+.code-toolbar button { --copy-surface: var(--well); position: relative; display: grid; place-items: center; flex: none; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--code-icon); cursor: pointer; }
+.code-toolbar button::before { content: ""; position: absolute; width: 26px; height: 26px; border-radius: 5px; background: var(--copy-surface); }
+@media (any-hover: hover) {
+  .code-toolbar button:hover { --copy-surface: var(--paper); color: var(--ink); }
+}
+@media (any-pointer: coarse) {
+  .code-toolbar { padding-block-start: 0; padding-inline-end: .1rem; }
+  .code-toolbar button { width: 44px; height: 44px; }
+}
 .code-toolbar button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .copy-icon { position: relative; width: 15px; height: 15px; }
-.copy-icon::before, .copy-icon::after { content: ""; position: absolute; box-sizing: border-box; width: 10px; height: 11px; border: 1px solid currentColor; border-radius: 2px; background: var(--well); }
+.copy-icon::before, .copy-icon::after { content: ""; position: absolute; box-sizing: border-box; width: 10px; height: 11px; border: 1px solid currentColor; border-radius: 2px; background: var(--copy-surface); }
 .copy-icon::before { top: 0; left: 0; }
 .copy-icon::after { bottom: 0; right: 0; }
 .code-block pre { margin: 0; border: 0; border-radius: 0 0 .65rem .65rem; padding-top: .35rem; }
