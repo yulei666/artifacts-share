@@ -5,7 +5,18 @@ description: Publish or update HTML, built site directories, and ZIP bundles thr
 
 # Artifacts Share
 
-Use the admin origin for authenticated requests. For this repository's deployment, the origin is `https://share.334700.xyz`. Set `ARTIFACTS_SHARE_URL` to the intended admin origin and use an `ARTIFACTS_SHARE_TOKEN` already provided through the environment. The user can create a token in the admin UI under **API tokens**. Keep the token out of command arguments, output, and source files.
+Use the instance's admin origin for authenticated requests, such as `https://share.example.com`. The user can create a token in the admin UI under **API tokens**.
+
+For sessions without shell environment variables, use `~/.config/artifacts-share/config.json`:
+
+```json
+{
+  "url": "https://share.example.com",
+  "token": "<API token>"
+}
+```
+
+Keep the file outside the repository and restrict it to the account running the skill (`chmod 600` on macOS/Linux). `ARTIFACTS_SHARE_CONFIG` can select another file. Non-empty `ARTIFACTS_SHARE_URL` and `ARTIFACTS_SHARE_TOKEN` override their matching fields. When overriding a configured URL with a different origin, supply that origin's token through `ARTIFACTS_SHARE_TOKEN` as well. Keep token values out of command arguments and output.
 
 ## Publish or update
 

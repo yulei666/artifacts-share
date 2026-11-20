@@ -29,22 +29,62 @@ class NoRedirect(HTTPRedirectHandler):
     return None
 
 
+def parse_origin(value):
+  try:
+    parsed = urlsplit(value)
+    host = parsed.hostname or ''
+    port = parsed.port
+  except ValueError:
+    raise ShareError('Expected an HTTPS admin origin, without /api/v1 or a share path.') from None
+  loopback = host in ('localhost', '127.0.0.1', '::1') or host.endswith('.localhost')
+  if (
+    not host or parsed.username is not None or parsed.path not in ('', '/')
+    or parsed.query or parsed.fragment or '\\' in value
+    or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value)
+    or (parsed.scheme != 'https' and not (loopback and parsed.scheme == 'http'))
+  ):
+    raise ShareError('Expected an HTTPS admin origin, without /api/v1 or a share path.')
+  authority = f'[{host}]' if ':' in host else host
+  default_port = 443 if parsed.scheme == 'https' else 80
+  if port is not None and port != default_port:
+    authority += f':{port}'
+  return f'{parsed.scheme}://{authority}'
+
+
+def connection_settings():
+  origin = os.environ.get('ARTIFACTS_SHARE_URL', '').strip()
+  token = os.environ.get('ARTIFACTS_SHARE_TOKEN', '').strip()
+  if not origin or not token:
+    override = os.environ.get('ARTIFACTS_SHARE_CONFIG', '').strip()
+    path = Path(override).expanduser() if override else Path.home() / '.config/artifacts-share/config.json'
+    try:
+      config = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+      if override:
+        raise ShareError(f'Config file does not exist: {path}') from None
+      config = {}
+    except (OSError, ValueError):
+      raise ShareError(f'Could not read JSON config: {path}') from None
+    if not isinstance(config, dict) or any(not isinstance(config.get(key, ''), str) for key in ('url', 'token')):
+      raise ShareError(f'Expected a JSON object with string url and token fields in {path}.')
+    file_origin = config.get('url', '').strip()
+    file_token = config.get('token', '').strip()
+    if origin and not token and file_token and file_origin and parse_origin(origin) != parse_origin(file_origin):
+      raise ShareError('Set ARTIFACTS_SHARE_TOKEN when overriding the configured admin origin.')
+    origin = origin or file_origin
+    token = token or file_token
+    if not origin or not token:
+      raise ShareError(f'Set ARTIFACTS_SHARE_URL and ARTIFACTS_SHARE_TOKEN, or provide url and token in {path}.')
+
+  if not token.isascii() or any(not 33 <= ord(char) <= 126 for char in token):
+    raise ShareError('Invalid Artifacts Share API token format.')
+  return parse_origin(origin), token
+
+
 class Client:
   def __init__(self):
-    origin = os.environ.get('ARTIFACTS_SHARE_URL', '').strip()
-    token = os.environ.get('ARTIFACTS_SHARE_TOKEN', '').strip()
-    if not origin or not token:
-      raise ShareError('Set ARTIFACTS_SHARE_URL and ARTIFACTS_SHARE_TOKEN.')
-    parsed = urlsplit(origin)
-    host = parsed.hostname or ''
-    loopback = host in ('localhost', '127.0.0.1', '::1') or host.endswith('.localhost')
-    if (
-      not host or parsed.username is not None or parsed.path not in ('', '/')
-      or parsed.query or parsed.fragment or any(char.isspace() for char in origin)
-      or (parsed.scheme != 'https' and not (loopback and parsed.scheme == 'http'))
-    ):
-      raise ShareError('ARTIFACTS_SHARE_URL must be the HTTPS admin origin, without /api/v1 or a share path.')
-    self.base = f'{parsed.scheme}://{parsed.netloc}/api/v1'
+    origin, token = connection_settings()
+    self.base = origin + '/api/v1'
     self.headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
     self.opener = build_opener(NoRedirect())
 
