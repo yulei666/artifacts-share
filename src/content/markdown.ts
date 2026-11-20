@@ -62,8 +62,14 @@ export function markdownObjectEtag(ifNoneMatch: string | null, lang: PageCtx['la
 }
 
 const TEXT = {
-  zh: { preview: '渲染预览', source: '源文件', loading: '正在渲染 Markdown…', error: '无法渲染 Markdown，可以切换到源文件。', tooLarge: '此 Markdown 文件过大，无法预览。' },
-  en: { preview: 'Preview', source: 'Source file', loading: 'Rendering Markdown…', error: 'Unable to render Markdown. You can still view the source file.', tooLarge: 'This Markdown file is too large to preview.' },
+  zh: {
+    preview: '渲染预览', source: '源文件', loading: '正在渲染 Markdown…', error: '无法渲染 Markdown，可以切换到源文件。', tooLarge: '此 Markdown 文件过大，无法预览。',
+    copy: '复制', copied: '已复制', copySelected: '已选中代码，请手动复制。', copyFailed: '复制失败，请手动选择并复制代码。',
+  },
+  en: {
+    preview: 'Preview', source: 'Source file', loading: 'Rendering Markdown…', error: 'Unable to render Markdown. You can still view the source file.', tooLarge: 'This Markdown file is too large to preview.',
+    copy: 'Copy', copied: 'Copied', copySelected: 'Code selected. Copy it manually.', copyFailed: 'Could not copy. Select the code to copy it manually.',
+  },
 };
 
 /** null means the file exceeds the browser rendering limit. HEAD can also omit its data. */
@@ -88,7 +94,9 @@ export function markdownPage(req: Request, ctx: PageCtx, headers: Headers, sourc
       </div>
     </div>
     <p role="status" data-error="${labels.error}">${labels.loading}</p>
-    <article id="reader:preview" class="markdown" hidden></article>
+    <article id="reader:preview" class="markdown" data-copy="${labels.copy}" data-copied="${labels.copied}"
+      data-copy-selected="${labels.copySelected}" data-copy-failed="${labels.copyFailed}" hidden></article>
+    <span id="reader:copy-status" class="visually-hidden" role="status"></span>
     <pre id="reader:source" class="source" hidden></pre>
     <script type="application/json" id="reader:markdown">${JSON.stringify(source).replace(/</g, '\\u003c')}</script>`;
   const html = `<!doctype html>

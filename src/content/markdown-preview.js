@@ -31,6 +31,7 @@ const parser = new MarkdownIt({
 const article = document.getElementById('reader:preview');
 const source = document.getElementById('reader:source');
 const status = document.querySelector('[role=status]');
+const copyStatus = document.getElementById('reader:copy-status');
 const buttons = document.querySelectorAll('[data-view]');
 let ready = false;
 let rendered = false;
@@ -43,6 +44,80 @@ function select(view) {
 }
 
 for (const button of buttons) button.addEventListener('click', () => select(button.dataset.view));
+
+async function copyCode(code) {
+  const { copied, copySelected, copyFailed } = article.dataset;
+  const text = code.textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    return copied;
+  } catch {
+    if (!code.isConnected || article.hidden) return copyFailed;
+    const selection = window.getSelection();
+    if (!selection) return copyFailed;
+    const previous = Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index));
+    const active = document.activeElement;
+    const field = document.createElement('textarea');
+    field.className = 'visually-hidden';
+    field.readOnly = true;
+    field.value = text;
+    document.body.append(field);
+    let didCopy = false;
+    try {
+      field.focus({ preventScroll: true });
+      field.select();
+      didCopy = document.execCommand('copy');
+    } catch {
+      // Leave the original code selected if the browser also blocks legacy copying.
+    } finally {
+      field.remove();
+      active?.focus({ preventScroll: true });
+    }
+    selection.removeAllRanges();
+    if (didCopy) {
+      for (const oldRange of previous) selection.addRange(oldRange);
+      return copied;
+    }
+    const range = document.createRange();
+    range.selectNodeContents(code);
+    selection.addRange(range);
+    return copySelected;
+  }
+}
+
+function addCopyButtons() {
+  const feedback = document.createElement('span');
+  feedback.setAttribute('aria-hidden', 'true');
+  let announceFeedback;
+  let clearFeedback;
+  for (const code of article.querySelectorAll('pre > code')) {
+    const pre = code.parentElement;
+    const block = document.createElement('div');
+    block.className = 'code-block';
+    const toolbar = document.createElement('div');
+    toolbar.className = 'code-toolbar';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = article.dataset.copy;
+    button.addEventListener('click', async () => {
+      const message = await copyCode(code);
+      clearTimeout(announceFeedback);
+      clearTimeout(clearFeedback);
+      toolbar.prepend(feedback);
+      feedback.textContent = message;
+      // Give assistive technology time to observe the empty region before repeating a message.
+      copyStatus.textContent = '';
+      announceFeedback = setTimeout(() => { copyStatus.textContent = message; }, 100);
+      clearFeedback = setTimeout(() => {
+        feedback.remove();
+        copyStatus.textContent = '';
+      }, 2500);
+    });
+    toolbar.append(button);
+    pre.replaceWith(block);
+    block.append(toolbar, pre);
+  }
+}
 
 async function renderDiagrams() {
   const diagrams = article.querySelectorAll('pre > code.language-mermaid');
@@ -63,7 +138,7 @@ async function renderDiagrams() {
       const figure = document.createElement('figure');
       figure.className = 'diagram';
       figure.innerHTML = svg;
-      code.parentElement.replaceWith(figure);
+      code.closest('.code-block').replaceWith(figure);
     } catch {
       // Keep the original code block when a diagram cannot be rendered.
     }
@@ -75,6 +150,7 @@ try {
   source.textContent = text;
   ready = true;
   article.innerHTML = parser.render(text);
+  addCopyButtons();
   const slugger = new GithubSlugger();
   for (const heading of article.querySelectorAll('h1, h2, h3, h4, h5, h6')) heading.id = slugger.slug(heading.textContent);
   rendered = true;
