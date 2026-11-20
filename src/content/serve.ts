@@ -1,4 +1,4 @@
-import { MARKDOWN_PREVIEW_MAX_BYTES, MARKDOWN_RAW_PARAM, markdownPage } from './markdown';
+import { MARKDOWN_PREVIEW_MAX_BYTES, MARKDOWN_RAW_PARAM, markdownEtag, markdownObjectEtag, markdownPage } from './markdown';
 import type { PageCtx } from './pages';
 import type { ArtifactRow, Env } from '../env';
 import { contentTypeFor, isHtmlPath, isMarkdownPath } from '../lib/mime';
@@ -8,6 +8,8 @@ import { r2Key } from '../lib/store';
 
 const PUBLIC_BROWSER_CACHE = 'private, max-age=0, must-revalidate';
 const EDGE_CACHE_MAX_BYTES = 5 * 1024 * 1024;
+/** Directory index files for Markdown folders, matched case-insensitively in inferEntry's order. */
+const MARKDOWN_INDEXES = ['index.md', 'index.markdown', 'readme.md', 'readme.markdown'];
 
 function baseHeaders(a: ArtifactRow, isPublic: boolean, ancestors: string): Headers {
   const h = new Headers({
@@ -43,6 +45,29 @@ function matchesEtag(value: string, etag: string | null, weak = false): boolean 
     const trimmed = tag.trim();
     return (weak ? trimmed.replace(/^W\//, '') : trimmed) === etag;
   });
+}
+
+/**
+ * Whether an Accept header prefers HTML over the Markdown source: text/html must be acceptable and rank above
+ * text/markdown / text/plain (by q, then by listing order). A wildcard alone is not a preference for HTML.
+ */
+export function prefersHtml(accept: string | null): boolean {
+  const ranked = (accept ?? '').split(',').map((part, index) => {
+    const [type, ...params] = part.trim().toLowerCase().split(';');
+    const q = params.map((p) => p.trim()).find((p) => p.startsWith('q='));
+    const weight = q ? Number(q.slice(2)) : 1;
+    return { type: type.trim(), q: Number.isFinite(weight) ? weight : 0, index };
+  });
+  const html = ranked.find((r) => r.type === 'text/html');
+  if (!html || html.q <= 0) return false;
+  return !ranked.some((r) => (r.type === 'text/markdown' || r.type === 'text/plain' || r.type === 'text/x-markdown')
+    && (r.q > html.q || (r.q === html.q && r.index < html.index)));
+}
+
+/** The last path segment has a dot-extension of a known file type (a missing asset rather than a directory). */
+function looksLikeFile(key: string): boolean {
+  const last = key.slice(key.lastIndexOf('/') + 1);
+  return last.lastIndexOf('.') > 0 && contentTypeFor(last) !== 'application/octet-stream';
 }
 
 function preconditionStatus(req: Request, obj: R2Object): 304 | 412 | null {
@@ -94,20 +119,31 @@ export async function serveFile(
     }
   };
 
+  // Browser page loads get the reader for *any* Markdown file (so a README's relative link to guide.md also
+  // renders). Everything else — curl, scripts, agents, fetch() — gets the raw file: without Sec-Fetch-Dest
+  // (older browsers, non-browser clients) only an Accept that asks for HTML counts as a page load.
+  const pageLoad = dest === 'document' || dest === 'iframe' || (!dest && prefersHtml(req.headers.get('accept')));
   // A reader response carries its source from the same authorized version snapshot.
-  if (path === a.entry && markdown && rawMarkdown === null
-    && (!dest || dest === 'document' || dest === 'iframe') && !req.headers.has('range')) {
+  if (markdown && rawMarkdown === null && pageLoad && !req.headers.has('range')) {
     const objectKey = r2Key(a.id, version, path);
-    const object = isHead ? await env.BUCKET.head(objectKey) : await env.BUCKET.get(objectKey);
+    // A reader validator from this shell and language names the object ETag it was built from; R2 checks it in
+    // the same GET (no body when it still matches), so a revalidation costs one operation either way.
+    const known = markdownObjectEtag(req.headers.get('if-none-match'), opts.lang);
+    const object = isHead
+      ? await env.BUCKET.head(objectKey)
+      : await env.BUCKET.get(objectKey, known ? { onlyIf: { etagDoesNotMatch: known } } : undefined);
     if (object) {
+      const etag = markdownEtag(object.httpEtag, opts.lang);
+      const headers = baseHeaders(a, isPublic, ancestors);
+      const body = 'body' in object ? object as R2ObjectBody : null;
+      if (known && object.etag === known && (isHead || !body)) return markdownPage(req, opts, headers, null, etag, true);
       let source: string | null = null;
-      if (!isHead) {
-        const body = object as R2ObjectBody;
+      if (body) {
         if (body.size <= MARKDOWN_PREVIEW_MAX_BYTES) source = await body.text();
         else await body.body.cancel();
       }
       countView();
-      return markdownPage(req, opts, baseHeaders(a, isPublic, ancestors), source);
+      return markdownPage(req, opts, headers, source, etag);
     }
   }
 
@@ -161,6 +197,27 @@ export async function serveFile(
     if (!trailing && key !== '' && (await env.BUCKET.head(r2Key(a.id, version, `${key}/index.html`)))) {
       return new Response(null, { status: 301, headers: { location: `${localPath(url.pathname)}/${url.search}`, 'cache-control': 'no-store' } });
     }
+    // A Markdown folder's directory URL (`guide/` or `guide`) opens its index.md or README.md, like the entry.
+    // One D1 lookup covers every candidate. A known file extension means a missing asset, not a directory;
+    // dotted directory names (`v1.2`) still qualify.
+    // HTML SPAs keep their client-side routes (no extra lookup, no redirect away from the app).
+    if (key !== '' && a.kind === 'folder' && (isMarkdownPath(a.entry) || !a.spa_fallback) && (trailing || !looksLikeFile(key))) {
+      // SQLite's lower() folds only ASCII and substr() counts code points, so match the directory exactly by
+      // code-point length and compare the (short, direct-child) file names in JS.
+      const dir = `${key}/`;
+      const dirLength = [...dir].length;
+      const { results } = await env.DB.prepare(
+        // `path >= dir AND path < dir-with-'/'-bumped-to-'0'` is an index range on the primary key.
+        'SELECT path FROM artifact_files WHERE artifact_id = ? AND version = ? AND path >= ? AND path < ? AND substr(path, 1, ?) = ? '
+        + 'AND length(path) - ? <= ? AND instr(substr(path, ? + 1), \'/\') = 0',
+      ).bind(a.id, version, dir, `${key}0`, dirLength, dir, dirLength, Math.max(...MARKDOWN_INDEXES.map((n) => n.length)), dirLength).all<{ path: string }>();
+      const found = MARKDOWN_INDEXES.map((name) => results.find((r) => r.path.slice(dir.length).toLowerCase() === name)?.path).find(Boolean);
+      if (found) {
+        // Built from the stored path, so `guide//` cannot yield a doubled slash that shifts `../` links.
+        const location = '/' + found.split('/').map(encodeURIComponent).join('/');
+        return new Response(null, { status: 302, headers: { location: location + url.search, 'cache-control': 'no-store' } });
+      }
+    }
     const wantsHtml = (req.headers.get('accept') ?? '').includes('text/html') || !/\.[a-z0-9]+$/i.test(path);
     if (a.spa_fallback && wantsHtml) {
       if (path !== a.entry && isMarkdownPath(a.entry)) {
@@ -183,7 +240,7 @@ export async function serveFile(
   // Older .markdown uploads used the fallback MIME type in R2.
   if (isMarkdownPath(servedPath)) {
     headers.set('content-type', plainMarkdown ? 'text/plain; charset=utf-8' : contentTypeFor(servedPath));
-    headers.append('vary', 'sec-fetch-dest');
+    headers.append('vary', 'sec-fetch-dest, accept');
   }
   headers.set('etag', obj.httpEtag);
   headers.set('last-modified', obj.uploaded.toUTCString());

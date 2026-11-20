@@ -2067,6 +2067,8 @@ describe('error codes for deleted artifacts', () => {
 
 describe('Markdown shares', () => {
   const notes = '# Notes\n\n```js\nconst value = 42;\n```\n';
+  /** A browser page load; anything else (curl, fetch) gets the raw file. */
+  const page = (url: string, cookie?: string) => fetchRaw(url, { headers: { 'sec-fetch-dest': 'document', ...(cookie ? { cookie } : {}) } });
 
   it('serves the Markdown reader by default and downloads the exact source', async () => {
     const a = await json(await api('/api/v1/artifacts?visibility=public&filename=Notes.markdown', {
@@ -2074,7 +2076,7 @@ describe('Markdown shares', () => {
     }), 201);
     expect(a).toMatchObject({ kind: 'markdown', entry: 'Notes.markdown' });
 
-    const preview = await fetchRaw(a.content_url);
+    const preview = await page(a.content_url);
     expect(preview.headers.get('content-type')).toContain('text/html');
     expect(preview.headers.get('content-security-policy')).toContain("default-src 'none'");
     expect(await preview.text()).toContain('/__share/markdown/preview.js');
@@ -2082,7 +2084,7 @@ describe('Markdown shares', () => {
     const raw = await fetchRaw(`${a.content_url}?__share_raw=1`);
     expect(raw.headers.get('content-type')).toContain('text/markdown');
     expect(await raw.text()).toBe(notes);
-    const again = await fetchRaw(a.content_url);
+    const again = await page(a.content_url);
     expect(again.headers.get('content-type')).toContain('text/html');
     await again.arrayBuffer();
 
@@ -2098,7 +2100,7 @@ describe('Markdown shares', () => {
     const a = await json(await api('/api/v1/artifacts?visibility=public', {
       method: 'POST', headers: { 'content-type': 'text/markdown' }, body: source,
     }), 201);
-    const res = await fetchRaw(a.content_url);
+    const res = await page(a.content_url);
     expect(res.headers.get('referrer-policy')).toBe('no-referrer');
     expect(res.headers.get('vary')).toContain('sec-fetch-dest');
     const preview = await res.text();
@@ -2113,13 +2115,97 @@ describe('Markdown shares', () => {
     expect(await asset.text()).toBe(source);
   });
 
+  it('sends raw Markdown to non-browser clients and renders any Markdown page in a folder', async () => {
+    const a = await json(await api('/api/v1/artifacts?visibility=public', {
+      method: 'POST', headers: { 'content-type': 'text/markdown' }, body: notes,
+    }), 201);
+    const curl = await fetchRaw(a.content_url, { headers: { accept: '*/*' } });
+    expect(curl.headers.get('content-type')).toContain('text/markdown');
+    expect(await curl.text()).toBe(notes);
+    for (const accept of ['text/markdown, text/html;q=0.9, */*', 'text/plain, text/html', 'text/html;q=0, */*']) {
+      const agent = await fetchRaw(a.content_url, { headers: { accept } });
+      expect(agent.headers.get('content-type')).toContain('text/markdown');
+      expect(await agent.text()).toBe(notes);
+    }
+    const legacy = await fetchRaw(a.content_url, { headers: { accept: 'text/html,*/*;q=0.8' } });
+    expect(legacy.headers.get('content-type')).toContain('text/html');
+    await legacy.arrayBuffer();
+
+    const form = new FormData();
+    form.append('file', new File([notes], 'README.md'));
+    form.append('file', new File(['# Guide\n'], 'docs/guide.md'));
+    const f = await json(await api('/api/v1/artifacts?visibility=public', { method: 'POST', body: form }), 201);
+    expect(f.entry).toBe('README.md');
+    const guide = await page(`${f.content_url}docs/guide.md`);
+    expect(guide.headers.get('content-type')).toContain('text/html');
+    expect(await guide.text()).toContain('id="reader:markdown"');
+    const guideRaw = await fetchRaw(`${f.content_url}docs/guide.md`);
+    expect(await guideRaw.text()).toBe('# Guide\n');
+  });
+
+  it('revalidates reader pages and bundle assets with a 304', async () => {
+    const a = await json(await api('/api/v1/artifacts?visibility=public', {
+      method: 'POST', headers: { 'content-type': 'text/markdown' }, body: notes,
+    }), 201);
+    const first = await page(a.content_url);
+    const etag = first.headers.get('etag');
+    expect(etag).toMatch(/^W\/"md-/);
+    await first.arrayBuffer();
+    const again = await fetchRaw(a.content_url, { headers: { 'sec-fetch-dest': 'document', 'if-none-match': etag! } });
+    expect(again.status).toBe(304);
+    expect(again.headers.get('content-security-policy')).toContain("default-src 'none'");
+    const other = await fetchRaw(a.content_url, { headers: { 'sec-fetch-dest': 'document', 'accept-language': etag!.includes('-zh-') ? 'en' : 'zh-CN', 'if-none-match': etag! } });
+    expect(other.status).toBe(200); // the language is part of the validator
+    await other.arrayBuffer();
+
+    const js = await fetchRaw(`${a.content_url}__share/markdown/preview.js`);
+    const jsTag = js.headers.get('etag');
+    const bundle = await js.text();
+    expect(jsTag).toBeTruthy();
+    const cached = await fetchRaw(`${a.content_url}__share/markdown/preview.js`, { headers: { 'if-none-match': jsTag! } });
+    expect(cached.status).toBe(304);
+    const chunkPath = bundle.match(/import\("\.\/(chunks\/[^"]+\.js)"\)/)?.[1];
+    const chunk = await fetchRaw(`${a.content_url}__share/markdown/${chunkPath}`);
+    expect(chunk.headers.get('cache-control')).toContain('immutable');
+    await chunk.arrayBuffer();
+  });
+
+  it('opens index.md or README.md for a directory URL in a Markdown folder', async () => {
+    const form = new FormData();
+    form.append('file', new File([notes], 'README.md'));
+    form.append('file', new File(['# Guide\n'], 'guide/index.md'));
+    form.append('file', new File(['# Ref\n'], 'ref/Readme.md'));
+    form.append('file', new File(['# Docs\n'], 'Über 📚/README.md'));
+    form.append('file', new File(['# Deep\n'], 'guide/sub/index.md'));
+    form.append('file', new File(['# V\n'], 'v1.2/README.md'));
+    form.append('file', new File(['# Md\n'], 'md/README.md'));
+    const f = await json(await api('/api/v1/artifacts?visibility=public', { method: 'POST', body: form }), 201);
+    for (const [path, location] of [['guide/', '/guide/index.md'], ['guide', '/guide/index.md'], ['guide//', '/guide/index.md'], ['v1.2', '/v1.2/README.md'], ['md', '/md/README.md'], ['ref/?x=1', '/ref/Readme.md?x=1'], ['%C3%9Cber%20%F0%9F%93%9A/', '/%C3%9Cber%20%F0%9F%93%9A/README.md']]) {
+      const res = await page(`${f.content_url}${path}`);
+      expect(res.status).toBe(302);
+      expect(res.headers.get('location')).toBe(location);
+    }
+    const missing = await page(`${f.content_url}nope/`);
+    expect(missing.status).toBe(404);
+    await missing.arrayBuffer();
+
+    // An HTML SPA keeps its client-side routes even when the build ships a docs/README.md.
+    const spa = new FormData();
+    spa.append('file', new File(['<h1>App</h1>'], 'index.html'));
+    spa.append('file', new File([notes], 'docs/README.md'));
+    const app = await json(await api('/api/v1/artifacts?visibility=public&spa_fallback=true', { method: 'POST', body: spa }), 201);
+    const route = await page(`${app.content_url}docs`);
+    expect(route.status).toBe(200);
+    expect(await route.text()).toBe('<h1>App</h1>');
+  });
+
   it('offers large Markdown as plain source without buffering it into the reader', async () => {
     const { MARKDOWN_PREVIEW_MAX_BYTES } = await import('../src/content/markdown');
     const source = 'x'.repeat(MARKDOWN_PREVIEW_MAX_BYTES + 1);
     const a = await json(await api('/api/v1/artifacts?visibility=public', {
       method: 'POST', headers: { 'content-type': 'text/markdown' }, body: source,
     }), 201);
-    const res = await fetchRaw(a.content_url);
+    const res = await page(a.content_url);
     const shell = await res.text();
     expect(shell).toContain('?__share_raw=plain');
     expect(shell).not.toContain('id="reader:markdown"');
@@ -2141,7 +2227,7 @@ describe('Markdown shares', () => {
     const fallback = await fetchRaw(`${a.content_url}nested/missing?x=1`);
     expect(fallback.status).toBe(302);
     expect(fallback.headers.get('location')).toBe('/docs/start.md?x=1');
-    const preview = await fetchRaw(new URL(fallback.headers.get('location')!, a.content_url).href);
+    const preview = await page(new URL(fallback.headers.get('location')!, a.content_url).href);
     expect(await preview.text()).toContain('id="reader:markdown"');
   });
 
@@ -2165,7 +2251,7 @@ describe('Markdown shares', () => {
     const root = await fetchRaw(a.content_url, { headers: { cookie } });
     expect(root.status).toBe(302);
     expect(root.headers.get('location')).toBe('/docs/start.md');
-    const preview = await fetchRaw(`${a.content_url}docs/start.md`, { headers: { cookie } });
+    const preview = await page(`${a.content_url}docs/start.md`, cookie);
     expect(await preview.text()).toContain('aria-controls="reader:source"');
     const source = await fetchRaw(`${a.content_url}docs/start.md?__share_raw=1`, { headers: { cookie } });
     expect(await source.text()).toBe(notes);
