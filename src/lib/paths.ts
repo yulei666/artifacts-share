@@ -9,6 +9,9 @@ export function normalizePath(input: string): string | null {
   if (typeof input !== 'string') return null;
   // eslint-disable-next-line no-control-regex
   if (/[\x00-\x1f\x7f]/.test(input)) return null;
+  // Not well-formed Unicode (a lone surrogate): it can't be stored as UTF-8 faithfully, so two different
+  // paths could collapse into one.
+  if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(input)) return null;
   // Windows-style separators (some zip tools write `assets\app.js`) become `/`; `..` segments are still
   // rejected below, so `..\x` can't escape either.
   let p = input.replace(/\\/g, '/').trim().replace(/^(\.\/)+/, '').replace(/^\/+/, '');

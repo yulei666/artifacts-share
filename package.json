@@ -6,7 +6,7 @@
   "scripts": {
     "vendor": "node scripts/vendor.mjs",
     "dev": "npm run vendor && node scripts/dev.mjs",
-    "deploy": "npm run vendor && wrangler deploy",
+    "deploy": "npm run vendor && npm run db:migrate:remote && wrangler deploy",
     "db:migrate:local": "wrangler d1 migrations apply artifacts-share --local",
     "db:migrate:remote": "wrangler d1 migrations apply artifacts-share --remote",
     "typecheck": "tsc --noEmit",

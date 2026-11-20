@@ -1785,3 +1785,144 @@ describe('publishing and authentication consistency', () => {
     await res.arrayBuffer();
   });
 });
+
+describe('review regressions (loop 2, round 2)', () => {
+  const jsonHeaders = { 'content-type': 'application/json' };
+
+  it('accepts a large manifest (stored as rows) and still checks it on commit', async () => {
+    const { env } = await import('cloudflare:workers');
+    await json(await api('/api/settings', { method: 'PATCH', auth: 'session', headers: jsonHeaders, body: JSON.stringify({ max_version_files: 10000 }) }), 200);
+    try {
+      // ~2.3 MB as one JSON string — over D1's per-value limit, fine as rows
+      const files = ['index.html', ...Array.from({ length: 5000 }, (_, i) => `d-${'x'.repeat(440)}/f-${i}.css`), 'index.html'];
+      const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ files }) }), 201);
+      expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM upload_expected WHERE upload_id = ?').bind(up.upload_id).first<any>()).n).toBe(5001); // de-duplicated
+      await json(await api(`/api/v1/uploads/${up.upload_id}/files/index.html`, { method: 'PUT', body: '<p>i</p>' }), 200);
+      const res = await api(`/api/v1/uploads/${up.upload_id}/commit`, { method: 'POST' });
+      expect(res.status).toBe(400);
+      expect((await res.json<any>()).error.message).toMatch(/^Missing 5000 file\(s\): d-x+\/f-0\.css/);
+      await (await api(`/api/v1/uploads/${up.upload_id}`, { method: 'DELETE' })).arrayBuffer();
+      expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM upload_expected WHERE upload_id = ?').bind(up.upload_id).first<any>()).n).toBe(0);
+    } finally {
+      await json(await api('/api/settings', { method: 'PATCH', auth: 'session', headers: jsonHeaders, body: JSON.stringify({ max_version_files: 2000 }) }), 200);
+    }
+  });
+
+  it('removes the manifest rows once the upload is committed', async () => {
+    const { env } = await import('cloudflare:workers');
+    const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ files: ['index.html'] }) }), 201);
+    await json(await api(`/api/v1/uploads/${up.upload_id}/files/index.html`, { method: 'PUT', body: '<p>i</p>' }), 200);
+    await json(await api(`/api/v1/uploads/${up.upload_id}/commit`, { method: 'POST' }), 201);
+    expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM upload_expected WHERE upload_id = ?').bind(up.upload_id).first<any>()).n).toBe(0);
+  });
+});
+
+describe('review regressions (loop 2, round 3)', () => {
+  const jsonHeaders = { 'content-type': 'application/json' };
+  const begin = async (files: string[]) => json(await api('/api/v1/uploads', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ files }) }), 201);
+
+  it('marks the session with its manifest size and refuses to commit while the list is pending', async () => {
+    const { env } = await import('cloudflare:workers');
+    const up = await begin(['index.html', 'a.css']);
+    const row = await env.DB.prepare('SELECT expected, manifest FROM uploads WHERE id = ?').bind(up.upload_id).first<any>();
+    expect(row).toEqual({ expected: null, manifest: 'rows:2' }); // legacy column stays NULL for older code
+    await env.DB.prepare("UPDATE uploads SET manifest = 'pending' WHERE id = ?").bind(up.upload_id).run();
+    await json(await api(`/api/v1/uploads/${up.upload_id}/files/index.html`, { method: 'PUT', body: '<p>i</p>' }), 200);
+    const res = await api(`/api/v1/uploads/${up.upload_id}/commit`, { method: 'POST' });
+    expect(res.status).toBe(409);
+    expect((await res.json<any>()).error.code).toBe('upload_busy');
+  });
+
+  it('fails the commit when manifest rows were lost instead of treating it as no manifest', async () => {
+    const { env } = await import('cloudflare:workers');
+    const up = await begin(['index.html', 'a.css']);
+    await json(await api(`/api/v1/uploads/${up.upload_id}/files/index.html`, { method: 'PUT', body: '<p>i</p>' }), 200);
+    await env.DB.prepare('DELETE FROM upload_expected WHERE upload_id = ?').bind(up.upload_id).run();
+    const res = await api(`/api/v1/uploads/${up.upload_id}/commit`, { method: 'POST' });
+    expect(res.status).toBe(409);
+    expect((await res.json<any>()).error.code).toBe('manifest_lost');
+  });
+
+  it('the cleanup sweep keeps manifest rows of live sessions', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { runCleanup } = await import('../src/cron');
+    const up = await begin(['index.html', 'a.css']);
+    await env.DB.prepare("INSERT INTO upload_expected (upload_id, path) VALUES ('gone-session', 'x.html')").run();
+    await runCleanup(env as any);
+    expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM upload_expected WHERE upload_id = ?').bind(up.upload_id).first<any>()).n).toBe(2);
+    expect(await env.DB.prepare("SELECT 1 FROM upload_expected WHERE upload_id = 'gone-session'").first()).toBeNull();
+  });
+});
+
+describe('review regressions (loop 2, round 4)', () => {
+  it('rejects paths that are not well-formed Unicode', async () => {
+    const res = await api('/api/v1/uploads', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ files: ['a\uD800.txt', 'a\uD801.txt'] }) });
+    expect(res.status).toBe(400);
+    expect((await res.json<any>()).error.code).toBe('invalid_path');
+    const ok = await api('/api/v1/uploads', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ files: ['emoji-\uD83D\uDE00.txt'] }) });
+    expect(ok.status).toBe(201); // a proper surrogate pair is fine
+    await ok.arrayBuffer();
+  });
+
+  it('still completes an abort when removing the manifest rows fails', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { abortUpload } = await import('../src/lib/store');
+    const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ files: ['index.html'] }) }), 201);
+    await json(await api(`/api/v1/uploads/${up.upload_id}/files/index.html`, { method: 'PUT', body: '<p>i</p>' }), 200);
+    const row = await env.DB.prepare('SELECT * FROM uploads WHERE id = ?').bind(up.upload_id).first<any>();
+    const db = new Proxy(env.DB, {
+      get: (t, p) =>
+        p === 'prepare'
+          ? (sql: string) => (sql.startsWith('DELETE FROM upload_expected') ? { bind: () => ({ run: () => Promise.reject(new Error('D1 hiccup')) }) } : (t as any).prepare(sql))
+          : typeof (t as any)[p] === 'function'
+            ? (t as any)[p].bind(t)
+            : (t as any)[p],
+    });
+    await abortUpload({ ...(env as any), DB: db }, row); // must not throw
+    expect(await env.BUCKET.head(`a/${up.artifact_id}/v${up.version}/index.html`)).toBeNull(); // files purged
+  });
+});
+
+describe('review regressions (loop 2, round 5)', () => {
+  it('stores a large manifest with only a few statements', async () => {
+    const { env } = await import('cloudflare:workers');
+    await json(await api('/api/settings', { method: 'PATCH', auth: 'session', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ max_version_files: 10000 }) }), 200);
+    const prepares: string[] = [];
+    const db = new Proxy(env.DB, {
+      get: (t, p) => (p === 'prepare' ? (sql: string) => (prepares.push(sql), (t as any).prepare(sql)) : typeof (t as any)[p] === 'function' ? (t as any)[p].bind(t) : (t as any)[p]),
+    });
+    try {
+      const { beginUpload } = await import('../src/lib/store');
+      const files = Array.from({ length: 10000 }, (_, i) => `dir-${'y'.repeat(300)}/f-${i}.css`);
+      const up = await beginUpload({ ...(env as any), DB: db }, { meta: {}, expected: files, createdBy: 'test' });
+      expect(up.manifest).toBe('rows:10000');
+      expect(prepares.filter((s) => s.startsWith('INSERT OR IGNORE INTO upload_expected')).length).toBeLessThan(15);
+    } finally {
+      await json(await api('/api/settings', { method: 'PATCH', auth: 'session', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ max_version_files: 2000 }) }), 200);
+    }
+  });
+});
+
+describe('review regressions (loop 2, round 7)', () => {
+  it('a commit that races a finished commit reports upload_closed, not a lost manifest', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { commitUpload } = await import('../src/lib/store');
+    const { getSettings } = await import('../src/lib/settings');
+    const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ files: ['index.html'] }) }), 201);
+    await json(await api(`/api/v1/uploads/${up.upload_id}/files/index.html`, { method: 'PUT', body: '<p>i</p>' }), 200);
+    const stale = await env.DB.prepare('SELECT * FROM uploads WHERE id = ?').bind(up.upload_id).first<any>(); // B read the session…
+    await json(await api(`/api/v1/uploads/${up.upload_id}/commit`, { method: 'POST' }), 201); // …then A committed it
+    await expect(commitUpload(env as any, stale, await getSettings(env as any))).rejects.toMatchObject({ code: 'upload_closed' });
+  });
+
+  it('a commit that races an abort reports upload_not_found, not missing files', async () => {
+    const { env } = await import('cloudflare:workers');
+    const { commitUpload } = await import('../src/lib/store');
+    const { getSettings } = await import('../src/lib/settings');
+    const up = await json(await api('/api/v1/uploads', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ files: ['index.html'] }) }), 201);
+    await json(await api(`/api/v1/uploads/${up.upload_id}/files/index.html`, { method: 'PUT', body: '<p>i</p>' }), 200);
+    const stale = await env.DB.prepare('SELECT * FROM uploads WHERE id = ?').bind(up.upload_id).first<any>();
+    expect((await api(`/api/v1/uploads/${up.upload_id}`, { method: 'DELETE' })).status).toBe(204);
+    await expect(commitUpload(env as any, stale, await getSettings(env as any))).rejects.toMatchObject({ code: 'upload_not_found' });
+  });
+});

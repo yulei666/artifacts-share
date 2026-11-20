@@ -23,7 +23,10 @@ export interface UploadRow {
   version: number;
   is_new: number;
   meta: string;
+  /** Legacy: JSON array of expected paths (sessions created before migration 0002). */
   expected: string | null;
+  /** NULL = no manifest; 'pending' while its rows are written; 'rows:<n>' when complete (rows in upload_expected). */
+  manifest?: string | null;
   file_count?: number;
   created_by: string | null;
   created_at: number;
@@ -202,7 +205,10 @@ export async function softDeleteArtifact(env: Env, id: string): Promise<void> {
 export async function purgeArtifact(env: Env, id: string): Promise<void> {
   // Upload sessions go first: an in-flight PUT then fails its liveness check and cleans up after itself,
   // and anything it wrote before that is caught by the prefix delete that follows.
-  await env.DB.prepare('DELETE FROM uploads WHERE artifact_id = ?').bind(id).run();
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM upload_expected WHERE upload_id IN (SELECT id FROM uploads WHERE artifact_id = ?)').bind(id),
+    env.DB.prepare('DELETE FROM uploads WHERE artifact_id = ?').bind(id),
+  ]);
   await deletePrefix(env, r2Prefix(id));
   await env.DB.batch([
     env.DB.prepare('DELETE FROM artifact_files WHERE artifact_id = ?').bind(id),
@@ -262,6 +268,7 @@ export async function beginUpload(
       if (!isIgnoredPath(n)) expected.push(n); // junk is dropped on upload, so don't wait for it
     }
   }
+  if (expected) expected = [...new Set(expected)]; // a path can be stored only once
 
   const t = now();
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -273,7 +280,8 @@ export async function beginUpload(
       version,
       is_new: isNew ? 1 : 0,
       meta: JSON.stringify(opts.meta),
-      expected: expected ? JSON.stringify(expected) : null,
+      expected: null, // legacy column: older code JSON-parses it, so new sessions leave it NULL
+      manifest: expected?.length ? 'pending' : null,
       created_by: opts.createdBy,
       created_at: t,
       expires_at: t + UPLOAD_TTL_SEC,
@@ -287,18 +295,66 @@ export async function beginUpload(
            SELECT ?1, ?2, ?3, ?4, ?5 WHERE ?6 OR ${active}`,
         ).bind(version, 'uploading', artifactId, t, opts.createdBy, upload.is_new),
         env.DB.prepare(
-          `INSERT INTO uploads (id, version, artifact_id, is_new, meta, expected, created_by, created_at, expires_at)
-           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 WHERE ?4 OR ${active}`,
-        ).bind(upload.id, version, artifactId, upload.is_new, upload.meta, upload.expected, upload.created_by, t, upload.expires_at),
+          `INSERT INTO uploads (id, version, artifact_id, is_new, meta, expected, manifest, created_by, created_at, expires_at)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 WHERE ?4 OR ${active}`,
+        ).bind(upload.id, version, artifactId, upload.is_new, upload.meta, upload.expected, upload.manifest ?? null, upload.created_by, t, upload.expires_at),
       ]);
       if (!allocated.meta.changes) throw new HttpError(404, 'not_found', 'Artifact not found');
     } catch (e) {
       if (String(e).includes('UNIQUE')) continue;
       throw e;
     }
+    // The session exists (marked 'pending', so it can't be committed yet, and the cleanup sweep only removes
+    // manifest rows whose session is gone). Write the manifest once, then mark it complete with its size.
+    if (expected?.length) {
+      try {
+        upload.manifest = `rows:${await insertExpected(env, upload.id, expected)}`;
+        await env.DB.prepare("UPDATE uploads SET manifest = ? WHERE id = ? AND manifest = 'pending'").bind(upload.manifest, upload.id).run();
+      } catch (e) {
+        await abortUpload(env, upload).catch(() => {});
+        throw e;
+      }
+    }
     return upload;
   }
   throw new HttpError(409, 'conflict', 'Could not allocate a version number, retry');
+}
+
+/**
+ * Writes a manifest as rows, in chunks that stay under D1's bound-parameter limit. Returns how many rows were
+ * actually stored — the number the commit later checks against, so any paths the database folds together
+ * can't look like a lost manifest.
+ */
+async function insertExpected(env: Env, uploadId: string, paths: string[]): Promise<number> {
+  // Each statement carries a JSON array of paths (json_each expands it), chunked by size: a handful of
+  // statements even for 10000 long paths — D1 counts every statement against a per-request query limit.
+  const CHUNK_BYTES = 512 * 1024;
+  const stmts: D1PreparedStatement[] = [];
+  let part: string[] = [];
+  let bytes = 0;
+  const flush = () => {
+    if (!part.length) return;
+    stmts.push(env.DB.prepare('INSERT OR IGNORE INTO upload_expected (upload_id, path) SELECT ?1, value FROM json_each(?2)').bind(uploadId, JSON.stringify(part)));
+    part = [];
+    bytes = 0;
+  };
+  const utf8 = new TextEncoder();
+  for (const p of paths) {
+    const size = utf8.encode(p).byteLength + 4; // plus JSON quoting/comma (paths have no control chars)
+    if (bytes + size > CHUNK_BYTES) flush();
+    part.push(p);
+    bytes += size;
+  }
+  flush();
+  let stored = 0;
+  for (let i = 0; i < stmts.length; i += 50) {
+    for (const r of await env.DB.batch(stmts.slice(i, i + 50))) stored += r.meta.changes;
+  }
+  return stored;
+}
+
+export async function deleteExpected(env: Env, uploadId: string): Promise<void> {
+  await env.DB.prepare('DELETE FROM upload_expected WHERE upload_id = ?').bind(uploadId).run();
 }
 
 export async function requireUpload(env: Env, id: string): Promise<UploadRow> {
@@ -377,6 +433,14 @@ const COMMIT_READY = `EXISTS (
   WHERE u.id = ? AND v.status = 'ready'
 )`;
 
+/** The session was committed or aborted by a concurrent request: say which, instead of a misleading error. */
+async function throwIfSessionGone(env: Env, upload: UploadRow): Promise<void> {
+  if (await env.DB.prepare('SELECT 1 FROM uploads WHERE id = ?').bind(upload.id).first()) return;
+  const v = await env.DB.prepare('SELECT status FROM artifact_versions WHERE artifact_id = ? AND version = ?').bind(upload.artifact_id, upload.version).first<{ status: string }>();
+  if (v?.status === 'ready') throw new HttpError(409, 'upload_closed', 'This upload was already committed');
+  throw new HttpError(404, 'upload_not_found', 'Upload session was aborted or expired');
+}
+
 export async function commitUpload(env: Env, upload: UploadRow, settings: Settings): Promise<ArtifactRow> {
   const [session, snapshot] = await env.DB.batch<{ revision: number; busy: number } | { path: string; size: number }>([
     env.DB.prepare('SELECT revision, EXISTS (SELECT 1 FROM upload_writes WHERE upload_id = uploads.id) AS busy FROM uploads WHERE id = ? AND expires_at > ?')
@@ -384,7 +448,10 @@ export async function commitUpload(env: Env, upload: UploadRow, settings: Settin
     env.DB.prepare('SELECT path, size FROM artifact_files WHERE artifact_id = ? AND version = ?').bind(upload.artifact_id, upload.version),
   ]);
   const state = session.results[0] as { revision: number; busy: number } | undefined;
-  if (!state) throw new HttpError(404, 'upload_not_found', 'Upload session was aborted or expired');
+  if (!state) {
+    await throwIfSessionGone(env, upload); // committed by a concurrent request → upload_closed
+    throw new HttpError(404, 'upload_not_found', 'Upload session was aborted or expired'); // row present but expired
+  }
   if (state.busy) throw new HttpError(409, 'upload_busy', 'File writes are still in progress');
   const files = snapshot.results as { path: string; size: number }[];
   if (files.length === 0) throw new HttpError(400, 'empty_upload', 'No files were uploaded');
@@ -392,7 +459,34 @@ export async function commitUpload(env: Env, upload: UploadRow, settings: Settin
   const paths = files.map((f) => f.path);
   const pathSet = new Set(paths);
 
-  if (upload.expected) {
+  if (upload.manifest === 'pending') throw new HttpError(409, 'upload_busy', 'The file list is still being saved; retry');
+  if (upload.manifest?.startsWith('rows:')) {
+    // Declared-but-missing files, checked in SQL against the manifest rows (never loaded whole). The row
+    // count must match what was declared: fewer rows means the manifest was lost, not that nothing is missing.
+    const declared = Number(upload.manifest.slice(5));
+    const q = await env.DB.batch([
+      env.DB.prepare('SELECT COUNT(*) AS n FROM upload_expected WHERE upload_id = ?').bind(upload.id),
+      env.DB.prepare(
+        'SELECT COUNT(*) AS n FROM upload_expected e WHERE e.upload_id = ?1 AND NOT EXISTS (SELECT 1 FROM artifact_files f WHERE f.artifact_id = ?2 AND f.version = ?3 AND f.path = e.path)',
+      ).bind(upload.id, upload.artifact_id, upload.version),
+      env.DB.prepare(
+        'SELECT path FROM upload_expected e WHERE e.upload_id = ?1 AND NOT EXISTS (SELECT 1 FROM artifact_files f WHERE f.artifact_id = ?2 AND f.version = ?3 AND f.path = e.path) ORDER BY path LIMIT 5',
+      ).bind(upload.id, upload.artifact_id, upload.version),
+    ]);
+    const missingCount = (q[1].results[0] as { n: number }).n;
+    const countOff = (q[0].results[0] as { n: number }).n !== declared;
+    // A concurrent commit or abort of this same session removes its manifest rows (and, for an abort, its
+    // files) — report what actually happened, not a lost manifest / missing files.
+    if (countOff || missingCount) await throwIfSessionGone(env, upload);
+    if (countOff) {
+      throw new HttpError(409, 'manifest_lost', 'The declared file list is incomplete; start the upload again');
+    }
+    if (missingCount) {
+      const sample = (q[2].results as { path: string }[]).map((r) => r.path);
+      throw new HttpError(400, 'missing_files', `Missing ${missingCount} file(s): ${sample.join(', ')}`);
+    }
+  } else if (upload.expected) {
+    // Sessions started before the manifest moved to rows keep it as JSON.
     const missing = (JSON.parse(upload.expected) as string[]).filter((p) => !pathSet.has(p));
     if (missing.length) throw new HttpError(400, 'missing_files', `Missing ${missing.length} file(s): ${missing.slice(0, 5).join(', ')}`);
   }
@@ -469,6 +563,8 @@ export async function commitUpload(env: Env, upload: UploadRow, settings: Settin
     }
     throw new HttpError(409, 'upload_busy', 'Files changed during commit; retry');
   }
+  // Committed: the manifest has served its purpose (left-overs are swept by the daily cleanup).
+  await deleteExpected(env, upload.id).catch(() => {});
   // The upload is stored (as a version in history) but a newer version is already live: the content and the
   // metadata sent with it did not take effect — say so instead of answering with the other version.
   if (existing && !results[1].meta.changes) {
@@ -495,6 +591,8 @@ export async function abortUpload(env: Env, upload: UploadRow): Promise<void> {
   // Already committed (or aborted) by someone else: its files are live / gone — don't touch them.
   if (!del.meta.changes) return;
   await purgeVersionFiles(env, upload.artifact_id, upload.version);
+  // The abort has already taken effect; leftover manifest rows are swept by the daily cleanup.
+  await deleteExpected(env, upload.id).catch(() => {});
 }
 
 /** Picks the entry for a version being made live: keep the current entry if it exists there, else the version's own. */

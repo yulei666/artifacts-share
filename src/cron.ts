@@ -91,6 +91,11 @@ export async function runCleanup(env: Env): Promise<void> {
     await eachRow('surplus version', results, async (s) => void (await retireVersion(env, s.artifact_id, s.version)));
   });
 
+  // Manifest rows whose session is gone (committed/aborted/expired, or a cleanup that failed part-way).
+  await step('orphan upload manifests', async () => {
+    await env.DB.prepare('DELETE FROM upload_expected WHERE upload_id NOT IN (SELECT id FROM uploads)').run();
+  });
+
   await step('expired auth state', async () => {
     await env.DB.batch([
       env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(t),
