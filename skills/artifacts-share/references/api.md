@@ -30,6 +30,8 @@ An upload session expires after 24 hours. The helper reads ZIP entries locally a
 
 Perform writes, version activation, link regeneration, or deletion only when the user requests that effect. The share-page download endpoint uses owner session authentication or visitor access rules. For Bearer-authenticated automation, use the file endpoints above.
 
+Browser navigation renders `.md` and `.markdown` files on `content_url`, including files linked from a folder's entry page. Relative links and images resolve from the current file's directory. A normal `curl` request returns the Markdown source. Append `?__share_raw=1` to an authorized content file URL to request the source explicitly.
+
 ## Failures
 
 - `401 invalid_token` usually means the token is missing, revoked, or for a different instance.

@@ -146,6 +146,16 @@ curl -X POST "$API/artifacts/$ID/regenerate-link" -H "Authorization: Bearer $TOK
 
 API 返回的 `url` 是分享链接（主域名 `/s/{id}`），`content_url` 是内容子域名的原始地址。
 
+### 浏览 Markdown
+
+在浏览器中打开 `.md` 或 `.markdown` 文件时，默认显示渲染预览，可切换到「源文件」。文件夹中的 Markdown 也一样，例如从 `README.md` 点开相对链接 `docs/guide.md`。相对链接和图片以当前文档所在目录为基准。
+
+访问子目录地址（如 `docs/`）时，若没有 `docs/index.html`，可打开该目录下的 `index.md`、`index.markdown`、`README.md` 或 `README.markdown`。开启 SPA 回退的 HTML 应用仍用客户端路由处理这类路径。
+
+脚本可从 `content_url` 对应的 Markdown 文件地址读取原文。`curl` 默认收到 `text/markdown`，也可以在文件地址加 `?__share_raw=1` 显式请求原文。内容仍受 artifact 的访问权限控制。
+
+### 分享页与下载
+
 访问码分享链接：`https://share.example.com/s/{id}?pwd=XXXXXX`（打开后自动解锁，并从地址栏去掉访问码）。
 
 分享页顶部工具栏：

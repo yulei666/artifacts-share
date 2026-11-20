@@ -283,19 +283,19 @@ a/{artifact_id}/v{version}/{path}
 
 | 形态 | 请求 | 说明 |
 |---|---|---|
-| A. 单 HTML | `POST /api/v1/artifacts`，`Content-Type: text/html` | 最常用 |
+| A. 单 HTML 或 Markdown | `POST /api/v1/artifacts`，`Content-Type: text/html` 或 `text/markdown` | Markdown 默认文件名为 `index.md`，可用 `filename` 指定 |
 | B. multipart | `POST /api/v1/artifacts`，`multipart/form-data`，filename 为相对路径 | 小文件夹 |
 | C. zip | `POST /api/v1/artifacts`，`Content-Type: application/zip` | **受 `server_unzip_enabled` 控制，默认关闭** |
 | D. 分批会话 | `POST /uploads` → `PUT /uploads/{uid}/files/{path}` × N → `POST /uploads/{uid}/commit` | 大文件夹；前端默认路径 |
 
-前端上传（无论 HTML、文件夹还是 zip）都在浏览器端处理后走形态 D：zip 由浏览器用 fflate 解压，**不依赖服务端开关**。服务端开关只影响 API 直传 zip。
+前端上传 HTML、Markdown、文件夹或 zip 都走形态 D。浏览器用 fflate 解压 zip，**不依赖服务端开关**。服务端开关只影响 API 直传 zip。
 
 ### 4.2 路径规范化
 
 - `/` 分隔，去掉前导 `./`、`/`；拒绝 `..`、空段、控制字符、`\`
 - 所有文件共享同一顶层目录时自动剥掉（如 `dist/`）
 - 禁止 `__share/` 前缀
-- entry：优先 `index.html`；否则唯一的 `.html`；否则需显式指定
+- 入口优先使用显式指定的 `entry`。上传新版本时，若未指定且原入口仍在，则沿用原入口。自动推断依次选择根目录 `index.html`、唯一的 HTML 文件。没有 HTML 时，优先选根目录的 `index.md` / `index.markdown`，其次是 `README.md` / `README.markdown`，再选唯一的 Markdown 文件。只有一个文件时可直接作为入口，其余情况需指定 `entry`。
 - Content-Type 按扩展名查表，文本类追加 `; charset=utf-8`
 
 ### 4.3 zip 安全（开启时）
@@ -349,14 +349,15 @@ a/{artifact_id}/v{version}/{path}
 
 ### 5.3 路径解析
 
-- `/` → entry；`/dir/` → `dir/index.html`
-- `/foo` 不存在而 `/foo/index.html` 存在 → 301 `/foo/`
-- 仍不存在：`spa_fallback` → entry；否则用 artifact 内 `404.html` 或默认 404
-- 支持 `ETag / If-None-Match → 304`、`Range → 206`
+- `/` 打开入口。嵌套入口通过 `302` 转到文件路径，保留相对链接和图片的解析基准。
+- `/dir/` 优先查找 `dir/index.html`。如果 `/dir` 不存在但有该 HTML 索引，则以 `301` 跳转到 `/dir/`。
+- 对 Markdown 入口的文件夹，或未启用 SPA 回退的文件夹，目录路径 `/dir` 和 `/dir/` 可回退到 Markdown 索引。按 `index.md`、`index.markdown`、`README.md`、`README.markdown` 的顺序匹配直接子文件，忽略文件名大小写。命中后以 `302` 跳转到文件路径并保留查询参数。
+- 仍未命中时，符合 SPA 回退条件的请求打开入口。Markdown 入口跳转到文件路径，HTML 入口直接返回内容。其他请求使用 artifact 内的 `404.html` 或默认 404。
+- 支持 `ETag` 和 `If-None-Match` 条件请求。原文支持 `Range` 请求。
 
 ### 5.4 响应头与缓存
 
-- 所有内容响应：`X-Content-Type-Options: nosniff`、`Referrer-Policy: strict-origin-when-cross-origin`
+- 文件响应使用 `X-Content-Type-Options: nosniff`。通常使用 `Referrer-Policy: strict-origin-when-cross-origin`，Markdown 预览使用 `no-referrer`。
 - **搜索收录**：除 `visibility = public 且 indexable = 1` 外，一律加 `X-Robots-Tag: noindex, nofollow, noarchive`，并拦截 `/robots.txt`
 - 不对用户 HTML 加限制性 CSP；网关自己的页面（解锁页、404）加严格 CSP
 - public：浏览器可保存响应，但需在使用前重新验证。网关在验权后查询 Cache API，内部缓存副本保留 60 秒，按子域名、版本、索引设置和文件路径区分。
@@ -563,7 +564,9 @@ curl -X POST "$API/artifacts" -H "Authorization: Bearer $T" \
   - 所有者：另外返回完整的 artifact 信息，以及 `frame_url`（一次性登录票据地址）。iframe 用它先在子域名上登录，私有 / 访问码内容直接可见。
 - **工具栏**：所有人可以复制链接、在新标签页打开、登录。所有者看到一个"分享"按钮（图标显示当前权限），点开是类似 Claude 的弹出面板：三种权限选项（带图标和说明）、访问码（复制 / 重新生成）、链接与"复制链接 + 访问码"。面板在点击外部、按 Esc、点进 iframe 时关闭。工具栏上另有进入管理页、退出登录。
 - **语言统一**：分享页把自己的界面语言用保留参数 `__lang` 传给 iframe，只在 iframe 会显示网关页面时才带上（访问码页、所有者登录跳转），公开内容不会收到这个参数。访问码表单里也带着语言，输错后重新显示时语言不变。网关的所有跳转都会去掉 `__lang`，它不会传到 artifact 自己的页面。退出登录时先让 iframe 访问 `/__share/logout`，清掉子域名上的所有者 Cookie，再退出主域名会话。
-- **Markdown 预览**：入口文件为 Markdown 时，内容子域先验权，再提供渲染预览和源码切换。Markdown 关闭内嵌 HTML，代码块按语言高亮，Mermaid 在浏览器端按需加载。每页尝试渲染前 20 个 Mermaid 代码块，其余保留原样。嵌套入口保留文件所在目录作为相对资源的基准。超过 2 MiB 的 Markdown 提供纯文本原文入口。
+- **Markdown 预览**适用于内容子域上任意 `.md` 或 `.markdown` 文件，包括文件夹中通过链接打开的非入口文件。网关先检查访问权限，再为浏览器页面和 iframe 导航返回预览。缺少 `Sec-Fetch-Dest` 时，根据 `Accept` 是否优先请求 `text/html` 决定是否返回预览。普通 `curl`、`fetch()` 和带 `Range` 的请求默认获得 `text/markdown` 原文。可用 `?__share_raw=1` 显式请求原文，或用 `?__share_raw=plain` 获取 `text/plain`。
+  - 预览和源码切换使用同一发布版本的内容。相对链接和图片以当前文件所在目录为基准。渲染时关闭内嵌 HTML，支持代码高亮，并在浏览器端按需加载 Mermaid。每页尝试渲染前 20 个 Mermaid 代码块，其余保留原样。超过 2 MiB 的文件提供纯文本原文入口。
+  - 预览和原文响应都带 `Vary: Sec-Fetch-Dest, Accept`。预览的弱 `ETag` 由模板、语言和 R2 源文件的 `ETag` 生成，匹配时返回 `304`。预览静态资源支持条件请求，带内容哈希的 JS 分块可长期缓存。
 - **下载**：单个 HTML 或 Markdown 下载源文件，文件夹下载包含全部文件的 ZIP。上传时可用 `source_kind: "folder"` 标记只有一个文件的文件夹。接口为 `GET /s/{public_id}/download`，以附件返回，并带 `CSP: sandbox`，不会在主域名上渲染。ZIP 从 R2 逐个读取文件，流式打包，文本按大小选择压缩，已压缩媒体原样存储。常规 ZIP 的偏移量不够时，写入 ZIP64 偏移量。
   - 权限：所有者总是可以下载；访客需要在设置中开启"允许访客下载"（`visitor_download_enabled`，默认关闭）。私有内容只有所有者能下载。访问码模式的访客通过 `POST /api/public/artifacts/{public_id}/download-token`，用访问码换取 5 分钟有效的下载凭证（访问码不出现在下载链接里；与解锁共用限流；重新生成访问码后旧凭证失效）。
   - 工具栏：一个"下载源文件 / 下载 ZIP"按钮，提示文字显示文件名、文件数和大小（访问码访客输入访问码前看不到这些信息）。访问码访客点击后弹出访问码输入框；分享链接带 `?pwd=` 时直接下载。
