@@ -11,6 +11,7 @@
 | 版本 | 变更 |
 |---|---|
 | v1 | 初版 |
+| v9 | 版本记录对应的上传会话（`artifact_versions.upload_id`，迁移 `0003`）：提交成功后重试提交返回 `409 upload_closed`，不再是 404；孤立清单行分批清理 |
 | v8 | 上传会话的文件清单改为按行存储（`upload_expected` 表 + `uploads.manifest` 状态列，迁移 `0002`），不再受 D1 单值约 2 MB 的限制；提交时用 SQL 校验缺失文件。`npm run deploy` 先执行远程迁移再部署代码 |
 | v7 | 失败计数从第一次失败开始；访问码提示剩余次数和等待时间；访问码输入失败 3 次后启用 Turnstile |
 | v6 | 管理员用户名（可配置、可在后台修改）；登录页 Cloudflare Turnstile（同一 IP 失败 3 次后启用） |

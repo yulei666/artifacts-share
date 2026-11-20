@@ -5,6 +5,28 @@ import { getSettings } from './lib/settings';
 import { abortUpload, purgeArtifact, purgeVersionFiles, retireVersion, type UploadRow } from './lib/store';
 
 /**
+ * Deletes manifest rows whose upload session is gone, `batch` rows per statement and at most `maxBatches`
+ * statements per run. Returns the number of rows deleted. 5k rows per statement keeps each DELETE short, well
+ * inside D1's per-statement time limit; 100 statements a run still clear up to 500k orphan rows a day, and a
+ * bigger backlog is worked off over the following days.
+ */
+export async function sweepOrphanManifests(env: Env, batch = 5_000, maxBatches = 100): Promise<number> {
+  let deleted = 0;
+  for (let i = 0; i < maxBatches; i++) {
+    const res = await env.DB.prepare(
+      `DELETE FROM upload_expected WHERE rowid IN (
+         SELECT e.rowid FROM upload_expected e WHERE NOT EXISTS (SELECT 1 FROM uploads u WHERE u.id = e.upload_id) LIMIT ?
+       )`,
+    )
+      .bind(batch)
+      .run();
+    deleted += res.meta.changes;
+    if (res.meta.changes < batch) break;
+  }
+  return deleted;
+}
+
+/**
  * Daily cleanup: stale uploads, deleted artifacts, surplus versions, expired auth state.
  * Every step — and every row within a step — is isolated: one failure is logged and skipped, it doesn't
  * stop the rest. Rows are picked in random order so a persistently failing row can't block a step forever.
@@ -92,9 +114,9 @@ export async function runCleanup(env: Env): Promise<void> {
   });
 
   // Manifest rows whose session is gone (committed/aborted/expired, or a cleanup that failed part-way).
-  await step('orphan upload manifests', async () => {
-    await env.DB.prepare('DELETE FROM upload_expected WHERE upload_id NOT IN (SELECT id FROM uploads)').run();
-  });
+  // Deleted in bounded batches, like every other step: a large backlog is worked off over successive
+  // batches/days instead of one huge DELETE that could time out (and roll back) every single day.
+  await step('orphan upload manifests', async () => void (await sweepOrphanManifests(env)));
 
   await step('expired auth state', async () => {
     await env.DB.batch([

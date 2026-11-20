@@ -309,6 +309,8 @@ api.put('/uploads/:uid/files/*', async (c) => {
 });
 
 api.post('/uploads/:uid/commit', async (c) => {
+  // requireUpload answers 409 upload_closed for a session that was already committed (a retry whose first
+  // response was lost), so the client doesn't upload the same content again.
   const u = await requireUpload(c.env, c.req.param('uid'));
   const a = await commitUpload(c.env, u, await getSettings(c.env, { fresh: true }));
   return c.json(await view(c, a), u.is_new ? 201 : 200);
