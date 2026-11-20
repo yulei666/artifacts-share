@@ -1,0 +1,49 @@
+# Copy to wrangler.toml (gitignored) and replace the example domains with yours.
+# The content domain should be a separate registrable domain from the admin domain.
+
+name = "artifacts-share"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+routes = [
+  { pattern = "share.example.com", custom_domain = true },
+  { pattern = "*.example-content.com/*", zone_name = "example-content.com" },
+]
+
+# Paid plan: headroom for server-side zip extraction (toggle in admin settings).
+[limits]
+cpu_ms = 300000
+
+[assets]
+directory = "./web"
+binding = "ASSETS"
+run_worker_first = true
+not_found_handling = "single-page-application"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "artifacts-share"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "artifacts-share"
+
+[triggers]
+crons = ["17 3 * * *"]
+
+[vars]
+MAIN_HOST = "share.example.com"
+CONTENT_ZONE = "example-content.com"
+CONTENT_HOST_SUFFIX = "-share"   # subdomain = {id}{suffix}.{CONTENT_ZONE}
+
+# Optional:
+# ADMIN_USERNAME = "admin"          # initial admin username (changeable in the admin UI)
+# TURNSTILE_SITE_KEY = "0x4AAA..."  # Cloudflare Turnstile on the login page (also set the secret below)
+
+# Secrets (wrangler secret put <NAME>):
+#   SECRET_KEY                 random >= 32 bytes; derives signing + encryption keys
+#   ADMIN_BOOTSTRAP_PASSWORD   first-login password, replaced by the one you set in the admin UI
+#   TURNSTILE_SECRET_KEY       optional; with TURNSTILE_SITE_KEY, login requires Turnstile after 3 failures
