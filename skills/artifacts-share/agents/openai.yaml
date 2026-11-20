@@ -1,0 +1,4 @@
+interface:
+  display_name: "Artifacts Share"
+  short_description: "Publish and update artifacts through the API"
+  default_prompt: "Use $artifacts-share to publish my built site with an access code and return its share link."
