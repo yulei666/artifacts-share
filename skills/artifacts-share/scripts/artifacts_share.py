@@ -85,7 +85,12 @@ class Client:
   def __init__(self):
     origin, token = connection_settings()
     self.base = origin + '/api/v1'
-    self.headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
+    # Cloudflare's Browser Integrity Check rejects urllib's default User-Agent with error 1010.
+    self.headers = {
+      'Authorization': f'Bearer {token}',
+      'Accept': 'application/json',
+      'User-Agent': 'artifacts-share-skill/1.0',
+    }
     self.opener = build_opener(NoRedirect())
 
   def request(self, method, endpoint, *, data=None, file=None, size=None):
