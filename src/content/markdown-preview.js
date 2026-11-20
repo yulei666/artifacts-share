@@ -15,9 +15,6 @@ import yaml from 'highlight.js/lib/languages/yaml';
 import './markdown-preview.css';
 
 const MAX_RENDERED_DIAGRAMS = 20;
-const copyLabels = document.documentElement.lang === 'zh-CN'
-  ? { copy: '复制', copied: '已复制', failed: '复制失败，请手动复制' }
-  : { copy: 'Copy', copied: 'Copied', failed: 'Could not copy. Select the code to copy it manually.' };
 
 for (const [name, language] of Object.entries({ bash, css, go, javascript, json, markdown, python, sql, typescript, xml, yaml })) {
   hljs.registerLanguage(name, language);
@@ -34,6 +31,7 @@ const parser = new MarkdownIt({
 const article = document.getElementById('reader:preview');
 const source = document.getElementById('reader:source');
 const status = document.querySelector('[role=status]');
+const copyStatus = document.getElementById('reader:copy-status');
 const buttons = document.querySelectorAll('[data-view]');
 let ready = false;
 let rendered = false;
@@ -47,30 +45,71 @@ function select(view) {
 
 for (const button of buttons) button.addEventListener('click', () => select(button.dataset.view));
 
+async function copyCode(code) {
+  const { copied, copySelected, copyFailed } = article.dataset;
+  const text = code.textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    return copied;
+  } catch {
+    if (!code.isConnected || article.hidden) return copyFailed;
+    const selection = window.getSelection();
+    if (!selection) return copyFailed;
+    const previous = Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index));
+    const active = document.activeElement;
+    const field = document.createElement('textarea');
+    field.className = 'visually-hidden';
+    field.readOnly = true;
+    field.value = text;
+    document.body.append(field);
+    let didCopy = false;
+    try {
+      field.focus({ preventScroll: true });
+      field.select();
+      didCopy = document.execCommand('copy');
+    } catch {
+      // Leave the original code selected if the browser also blocks legacy copying.
+    } finally {
+      field.remove();
+      active?.focus({ preventScroll: true });
+    }
+    selection.removeAllRanges();
+    if (didCopy) {
+      for (const oldRange of previous) selection.addRange(oldRange);
+      return copied;
+    }
+    const range = document.createRange();
+    range.selectNodeContents(code);
+    selection.addRange(range);
+    return copySelected;
+  }
+}
+
 function addCopyButtons() {
+  const feedback = document.createElement('span');
+  feedback.setAttribute('aria-hidden', 'true');
+  let clearFeedback;
   for (const code of article.querySelectorAll('pre > code')) {
     const pre = code.parentElement;
     const block = document.createElement('div');
     block.className = 'code-block';
     const toolbar = document.createElement('div');
     toolbar.className = 'code-toolbar';
-    const feedback = document.createElement('span');
-    feedback.setAttribute('role', 'status');
     const button = document.createElement('button');
     button.type = 'button';
-    button.textContent = copyLabels.copy;
-    let clearFeedback;
+    button.textContent = article.dataset.copy;
     button.addEventListener('click', async () => {
+      const message = await copyCode(code);
       clearTimeout(clearFeedback);
-      try {
-        await navigator.clipboard.writeText(code.textContent);
-        feedback.textContent = copyLabels.copied;
-        clearFeedback = setTimeout(() => { feedback.textContent = ''; }, 2000);
-      } catch {
-        feedback.textContent = copyLabels.failed;
-      }
+      toolbar.prepend(feedback);
+      feedback.textContent = message;
+      copyStatus.textContent = message;
+      clearFeedback = setTimeout(() => {
+        feedback.remove();
+        copyStatus.textContent = '';
+      }, 2500);
     });
-    toolbar.append(feedback, button);
+    toolbar.append(button);
     pre.replaceWith(block);
     block.append(toolbar, pre);
   }
