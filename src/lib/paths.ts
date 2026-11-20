@@ -1,3 +1,5 @@
+import { isHtmlPath, isMarkdownPath } from './mime';
+
 export const RESERVED_PREFIX = '__share';
 const IGNORED = /(^|\/)(__MACOSX(\/|$)|\.DS_Store$|Thumbs\.db$)/;
 
@@ -38,11 +40,17 @@ export function stripCommonRoot(paths: string[]): { strip: string; paths: string
   return { strip: root, paths: paths.map((p) => p.slice(root.length)) };
 }
 
-/** Picks the entry: index.html, else the only .html file, else the only file (e.g. a lone PDF). */
+/** Prefer existing HTML conventions, then a conventional or unambiguous Markdown entry. */
 export function inferEntry(paths: string[]): string | null {
   if (paths.includes('index.html')) return 'index.html';
-  const html = paths.filter((p) => /\.html?$/i.test(p));
+  const html = paths.filter(isHtmlPath);
   if (html.length === 1) return html[0];
+  if (!html.length) {
+    const markdown = paths.filter(isMarkdownPath);
+    const named = markdown.find((path) => /^index\.(?:md|markdown)$/i.test(path))
+      ?? markdown.find((path) => /^readme\.(?:md|markdown)$/i.test(path));
+    if (named || markdown.length === 1) return named ?? markdown[0];
+  }
   return paths.length === 1 ? paths[0] : null;
 }
 

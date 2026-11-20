@@ -5,6 +5,7 @@ import { clearHostCookie, hostCookie, HttpError, localPath, now, parseCookies, r
 import { type AttemptResult, captchaRequired, verifyAccessCode } from '../lib/access';
 import { getArtifactByPublicId } from '../lib/store';
 import { cookiesBlockedPage, errorPage, LANG_PARAM, type MessageKey, notFoundPage, type PageCtx, resolveLang, type UnlockError, unlockPage } from './pages';
+import { markdownAsset } from './markdown';
 import { serveFile } from './serve';
 
 const OWNER_TTL = 12 * 3600;
@@ -80,6 +81,7 @@ function withCheck(path: string, ctx: PageCtx, pwd?: string): string {
 export async function handleContent(req: Request, env: Env, execCtx: ExecutionContext, id: string): Promise<Response> {
   const url = new URL(req.url);
   const ctx: PageCtx = pageCtx(env, req);
+  if (url.pathname.startsWith('/__share/markdown/')) return markdownAsset(req, env, url);
   if (url.pathname.startsWith('/__share/')) return shareRoutes(req, env, id, url, ctx);
   if (req.method !== 'GET' && req.method !== 'HEAD') return new Response('Method not allowed', { status: 405, headers: { allow: 'GET, HEAD' } });
 
@@ -130,7 +132,7 @@ export async function handleContent(req: Request, env: Env, execCtx: ExecutionCo
     return redirect(returnPath(url, a.visibility === 'password' ? ['pwd'] : []));
   }
   // The owner's own previews are not views.
-  return serveFile(req, env, execCtx, a, { isPublic: a.visibility === 'public' && !owner, ancestors: ctx.ancestors, countView: !owner });
+  return serveFile(req, env, execCtx, a, { isPublic: a.visibility === 'public' && !owner, ancestors: ctx.ancestors, lang: ctx.lang, countView: !owner });
 }
 
 /** The unlock form, with the error of a failed attempt and Turnstile when this IP now needs it. */

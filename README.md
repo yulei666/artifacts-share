@@ -5,7 +5,7 @@
 - 管理后台 + API：主域名，例如 `https://share.example.com`
 - 分享链接：`https://share.example.com/s/{id}`。和 Claude Artifacts 一样，页面顶部是工具栏，下面用 iframe 加载内容
 - 内容放在每个 artifact 独立的子域名：`https://{id}-share.example-content.com`，只允许被主域名的分享页嵌入
-- 支持单 HTML / 文件夹 / zip；访问权限：私有、公开、访问码（6 位字母数字）
+- 支持单 HTML、Markdown、文件夹和 ZIP；访问权限：私有、公开、访问码（6 位字母数字）
 - 后台和访客页面支持中文 / English
 - 登录：管理员密码 + 可选 SSO（Google / GitHub / Cloudflare Access，各绑定一个账号）
 - API 用 Bearer Token 访问，Token 在后台管理
@@ -115,6 +115,10 @@ API=https://share.example.com/api/v1
 curl -X POST "$API/artifacts?title=Demo&visibility=public" \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: text/html" --data-binary @demo.html
 
+# 单个 Markdown（分享页默认渲染，可切换源码）
+curl -X POST "$API/artifacts?filename=notes.md" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: text/markdown" --data-binary @notes.md
+
 # 文件夹（multipart，filename 为相对路径）
 curl -X POST "$API/artifacts?visibility=password" -H "Authorization: Bearer $TOKEN" \
   -F "file=@dist/index.html;filename=index.html" \
@@ -136,6 +140,8 @@ curl -X POST "$API/artifacts/$ID/regenerate-link" -H "Authorization: Bearer $TOK
   -H "Content-Type: application/json" -d '{"reset_password": true}'
 ```
 
+文件夹可以用 `entry` 指定 HTML 或 Markdown 入口。直接上传或分批上传时传 `source_kind=folder`（分批上传放在 JSON 请求体里），可以把单文件目录也保留为文件夹。
+
 大文件夹用分批上传：`POST /uploads` → 逐个 `PUT /uploads/{id}/files/{path}` → `POST /uploads/{id}/commit`。完整接口列表见 [docs/DESIGN.md §8](docs/DESIGN.md)。
 
 API 返回的 `url` 是分享链接（主域名 `/s/{id}`），`content_url` 是内容子域名的原始地址。
@@ -144,7 +150,7 @@ API 返回的 `url` 是分享链接（主域名 `/s/{id}`），`content_url` 是
 
 分享页顶部工具栏：
 - 所有人：标题、复制链接、在新标签页打开、登录
-- 下载：单文件 artifact 下载 HTML，多文件下载 ZIP（全部文件）。所有者总是可以下载；访客需要先在设置里打开"允许访客下载"（默认关闭），访问码模式还要输入访问码
+- 下载：单个 HTML 或 Markdown 下载源文件，文件夹下载 ZIP（包括只有一个文件的文件夹）。所有者总是可以下载；访客需要先在设置里打开"允许访客下载"（默认关闭），访问码模式还要输入访问码
 - 已登录（所有者）：另外可以切换访问权限（私有 / 公开 / 访问码）、查看、复制和重新生成访问码，进入管理页，以及退出登录
 
 ## 本地开发

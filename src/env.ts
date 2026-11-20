@@ -23,7 +23,7 @@ export interface ArtifactRow {
   /** Subdomain id; can be regenerated to invalidate the old link. */
   public_id: string;
   title: string;
-  kind: 'html' | 'folder';
+  kind: 'html' | 'markdown' | 'folder';
   visibility: Visibility;
   password_enc: string | null;
   password_ver: number;

@@ -69,8 +69,8 @@ async function filesFromRequest(c: AppContext, settings: Settings): Promise<{ fi
   const ct = (c.req.header('content-type') ?? '').toLowerCase();
   const url = new URL(c.req.url);
 
-  if (ct.startsWith('text/html') || ct.startsWith('text/plain')) {
-    const name = normalizePath(url.searchParams.get('filename') ?? url.searchParams.get('entry') ?? 'index.html');
+  if (ct.startsWith('text/html') || ct.startsWith('text/plain') || ct.startsWith('text/markdown')) {
+    const name = normalizePath(url.searchParams.get('filename') ?? url.searchParams.get('entry') ?? (ct.startsWith('text/markdown') ? 'index.md' : 'index.html'));
     if (!name) throw new HttpError(400, 'invalid_path', 'Invalid filename');
     // Never decode a big body into a JS string: stream it to R2 when the length is known, else read it under the cap.
     const len = c.req.header('content-length');
@@ -104,7 +104,7 @@ async function filesFromRequest(c: AppContext, settings: Settings): Promise<{ fi
           }
           if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new HttpError(400, 'invalid_meta', 'meta must be a JSON object');
           extraMeta = { ...(parsed as Record<string, unknown>), ...extraMeta }; // explicit fields win, in any order
-        } else if (['title', 'visibility', 'entry', 'spa_fallback', 'indexable'].includes(field)) {
+        } else if (['title', 'visibility', 'entry', 'spa_fallback', 'indexable', 'source_kind'].includes(field)) {
           extraMeta[field] = value;
         }
         continue;
@@ -120,10 +120,10 @@ async function filesFromRequest(c: AppContext, settings: Settings): Promise<{ fi
     }
     // Request + extracted files all live in memory (128 MB isolate limit), hence the tight cap.
     const data = await readBodyLimited(c.req.raw, settings.unzip_max_bytes, 'zip_too_large');
-    return { files: extractZip(data, settings), extraMeta: {} };
+    return { files: extractZip(data, settings), extraMeta: { source_kind: 'folder' } };
   }
 
-  throw new HttpError(415, 'unsupported_media_type', 'Use text/html, multipart/form-data or application/zip');
+  throw new HttpError(415, 'unsupported_media_type', 'Use text/html, text/markdown, multipart/form-data or application/zip');
 }
 
 async function directUpload(c: AppContext, artifactId?: string) {

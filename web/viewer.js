@@ -229,7 +229,7 @@ function downloadContent(error) {
     captchaBox,
     error ? h('p', { class: 'pop-error' }, error) : null,
   );
-  return [h('div', { class: 'pop-head' }, t(info.download.kind === 'html' ? 'dl.html' : 'dl.zip')), form];
+  return [h('div', { class: 'pop-head' }, t(info.download.kind === 'zip' ? 'dl.zip' : 'dl.source')), form];
 }
 
 function renderPopover(error) {
@@ -317,11 +317,11 @@ function onDownload() {
 
 function downloadButton() {
   const d = info.download;
-  const label = t(d.kind === 'html' ? 'dl.html' : 'dl.zip');
+  const label = t(d.kind === 'zip' ? 'dl.zip' : 'dl.source');
   const detail = d.needs_code
     ? label
-    : d.kind === 'html'
-      ? t('dl.htmlTitle', { name: d.name, size: fmtBytes(d.size) })
+    : d.kind !== 'zip'
+      ? t('dl.sourceTitle', { name: d.name, size: fmtBytes(d.size) })
       : t('dl.zipTitle', { name: d.name, n: d.file_count, size: fmtBytes(d.size) });
   dlBtn = h(
     'button',

@@ -275,7 +275,7 @@ async function viewList() {
             'td',
             { class: 'title-cell' },
             a.title || h('span', { class: 'muted' }, t('common.untitled')),
-            h('div', { class: 'muted small mono' }, a.kind === 'html' ? t('list.kindHtml') : t('list.kindFolder', { n: a.file_count })),
+            h('div', { class: 'muted small mono' }, a.kind === 'folder' ? t('list.kindFolder', { n: a.file_count }) : t(a.kind === 'markdown' ? 'list.kindMarkdown' : 'list.kindHtml')),
           ),
           h('td', {}, badge(a.visibility)),
           h('td', { class: 'hide-sm muted' }, fmtBytes(a.total_size)),
@@ -312,7 +312,7 @@ const IGNORED = /(^|\/)(__MACOSX(\/|$)|\.DS_Store$|Thumbs\.db$)/;
 
 async function readDropped(dataTransfer) {
   const items = [...(dataTransfer.items || [])].map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
-  if (!items.length) return [...dataTransfer.files].map((f) => ({ path: f.name, blob: f }));
+  if (!items.length) return { files: [...dataTransfer.files].map((f) => ({ path: f.name, blob: f })), folder: false };
   const out = [];
   async function walk(entry, prefix) {
     if (entry.isFile) {
@@ -328,7 +328,7 @@ async function readDropped(dataTransfer) {
     }
   }
   for (const e of items) await walk(e, '');
-  return out;
+  return { files: out, folder: items.some((entry) => entry.isDirectory) };
 }
 
 async function expandZip(file) {
@@ -356,6 +356,10 @@ function normalizeFiles(files) {
  */
 function uploadPanel({ artifactId, currentEntry, onDone }) {
   let files = [];
+  let folderUpload = false;
+  let selection = 0;
+  let choosingFiles = false;
+  let publishing = false;
   const title = h('input', { placeholder: t('common.untitled') });
   let suggestedTitle = '';
   let visibility = null;
@@ -381,8 +385,8 @@ function uploadPanel({ artifactId, currentEntry, onDone }) {
   );
   if (!artifactId) {
     api('GET', '/api/settings')
-      .then((s) => segBtns[s.default_visibility]?.click())
-      .catch(() => segBtns.private.click());
+      .then((s) => { if (visibility === null) segBtns[s.default_visibility]?.click(); })
+      .catch(() => { if (visibility === null) segBtns.private.click(); });
   }
 
   const paste = h('textarea', { placeholder: t('upload.paste') });
@@ -397,17 +401,38 @@ function uploadPanel({ artifactId, currentEntry, onDone }) {
   const fileInput = h('input', { type: 'file', multiple: true, hidden: true });
   const dirInput = h('input', { type: 'file', webkitdirectory: true, hidden: true });
 
-  async function setFiles(raw) {
-    if (raw.length === 1 && /\.zip$/i.test(raw[0].path)) {
-      status.textContent = t('upload.extracting');
-      suggestedTitle = raw[0].path.replace(/\.zip$/i, '');
-      raw = await expandZip(raw[0].blob);
-    } else if (raw.length > 1) {
-      suggestedTitle = raw[0].path.includes('/') ? raw[0].path.split('/')[0] : '';
-    } else {
-      suggestedTitle = raw[0]?.path.replace(/\.html?$/i, '') ?? '';
+  async function chooseFiles(readSelection) {
+    if (publishing) return;
+    const request = ++selection;
+    choosingFiles = true;
+    submit.disabled = true;
+    try {
+      const { files: raw, folder } = await readSelection();
+      if (request !== selection) return;
+      const firstPath = raw[0]?.path ?? '';
+      const isZip = !folder && raw.length === 1 && /\.zip$/i.test(firstPath);
+      const title = isZip ? firstPath.replace(/\.zip$/i, '')
+        : folder || raw.length > 1 ? (firstPath.includes('/') ? firstPath.split('/')[0] : '')
+        : firstPath.replace(/\.(?:html?|md|markdown)$/i, '');
+      if (isZip) status.textContent = t('upload.extracting');
+      const selected = isZip ? await expandZip(raw[0].blob) : raw;
+      if (request === selection) setFiles(selected, folder || isZip, title);
+    } catch (error) {
+      if (request !== selection) return;
+      setFiles([], false, '');
+      throw error;
+    } finally {
+      if (request === selection) {
+        choosingFiles = false;
+        submit.disabled = false;
+      }
     }
+  }
+
+  function setFiles(raw, folder, titleSuggestion) {
     files = normalizeFiles(raw);
+    folderUpload = folder;
+    suggestedTitle = titleSuggestion;
     paste.value = '';
     paste.hidden = files.length > 0;
     const total = files.reduce((s, f) => s + f.blob.size, 0);
@@ -416,16 +441,29 @@ function uploadPanel({ artifactId, currentEntry, onDone }) {
     status.textContent = files.length ? t('upload.summary', { n: files.length, size: fmtBytes(total) }) : '';
     const paths = files.map((f) => f.path);
     const html = paths.filter((p) => /\.html?$/i.test(p));
-    // Ask only when the server can't pick one itself (it uses index.html, the only HTML file, the only
-    // file, or — for a new version — the current entry if still present). No HTML at all: offer every file.
-    const serverPicks = paths.includes('index.html') || html.length === 1 || paths.length === 1 || (!!currentEntry && paths.includes(currentEntry));
-    entryRow.hidden = !paths.length || serverPicks;
-    entrySel.replaceChildren(...(html.length ? html : paths).map((p) => h('option', { value: p }, p)));
+    const markdown = paths.filter((p) => /\.(?:md|markdown)$/i.test(p));
+    const current = paths.includes(currentEntry) ? currentEntry : null;
+    const preferredMarkdown = markdown.find((p) => /^index\.(?:md|markdown)$/i.test(p))
+      ?? markdown.find((p) => /^readme\.(?:md|markdown)$/i.test(p))
+      ?? (markdown.length === 1 ? markdown[0] : null);
+    const preferred = current ?? (paths.includes('index.html') ? 'index.html' : null)
+      ?? (html.length === 1 ? html[0] : null) ?? (!html.length ? preferredMarkdown : null)
+      ?? (paths.length === 1 ? paths[0] : null);
+    const documents = [...new Set([...html, ...markdown, ...(current ? [current] : [])])];
+    const options = documents.length ? documents : paths;
+    entryRow.hidden = !paths.length || (options.length === 1 && !!preferred);
+    entrySel.replaceChildren(...options.map((p) => h('option', { value: p, selected: p === preferred }, p)));
     title.placeholder = suggestedTitle || t('common.untitled');
   }
 
-  fileInput.addEventListener('change', () => act(null, () => setFiles([...fileInput.files].map((f) => ({ path: f.name, blob: f })))));
-  dirInput.addEventListener('change', () => act(null, () => setFiles([...dirInput.files].map((f) => ({ path: f.webkitRelativePath || f.name, blob: f })))));
+  fileInput.addEventListener('change', () => act(null, () => chooseFiles(() => ({
+    files: [...fileInput.files].map((f) => ({ path: f.name, blob: f })),
+    folder: false,
+  }))));
+  dirInput.addEventListener('change', () => act(null, () => chooseFiles(() => ({
+    files: [...dirInput.files].map((f) => ({ path: f.webkitRelativePath || f.name, blob: f })),
+    folder: true,
+  }))));
 
   const drop = h(
     'div',
@@ -439,7 +477,7 @@ function uploadPanel({ artifactId, currentEntry, onDone }) {
       ondrop: async (e) => {
         e.preventDefault();
         drop.classList.remove('over');
-        await act(null, async () => setFiles(await readDropped(e.dataTransfer)));
+        await act(null, () => chooseFiles(() => readDropped(e.dataTransfer)));
       },
     },
     h('p', {}, h('strong', {}, t('upload.dropTitle'))),
@@ -454,12 +492,15 @@ function uploadPanel({ artifactId, currentEntry, onDone }) {
     dirInput,
   );
 
-  submit.addEventListener('click', () =>
-    act(submit, async () => {
+  submit.addEventListener('click', async () => {
+    if (choosingFiles || publishing) return;
+    publishing = true;
+    await act(submit, async () => {
       let toSend = files;
       if (!toSend.length && paste.value.trim()) toSend = [{ path: 'index.html', blob: new Blob([paste.value], { type: 'text/html' }) }];
       if (!toSend.length) throw new Error(t('upload.nothing'));
       const meta = { files: toSend.map((f) => f.path) };
+      if (files.length && folderUpload) meta.source_kind = 'folder';
       if (!entryRow.hidden && entrySel.value) meta.entry = entrySel.value;
       if (artifactId) meta.artifact_id = artifactId;
       else {
@@ -508,8 +549,9 @@ function uploadPanel({ artifactId, currentEntry, onDone }) {
         status.textContent = '';
         throw e;
       }
-    }),
-  );
+    });
+    publishing = false;
+  });
 
   return h(
     'div',
@@ -598,8 +640,8 @@ async function viewDetail(id) {
 
   const indexable = h('input', { type: 'checkbox', checked: a.indexable, disabled: a.visibility !== 'public', onchange: () => act(null, () => patch({ indexable: indexable.checked })) });
   const spa = h('input', { type: 'checkbox', checked: a.spa_fallback, onchange: () => act(null, () => patch({ spa_fallback: spa.checked })) });
-  const htmlFiles = files.items.filter((f) => /\.html?$/i.test(f.path)).map((f) => f.path);
-  const entry = h('select', { onchange: () => act(null, () => patch({ entry: entry.value })) }, ...htmlFiles.map((p) => h('option', { value: p, selected: p === a.entry }, p)));
+  const entryFiles = files.items.filter((f) => f.path === a.entry || /\.(?:html?|md|markdown)$/i.test(f.path)).map((f) => f.path);
+  const entry = h('select', { onchange: () => act(null, () => patch({ entry: entry.value })) }, ...entryFiles.map((p) => h('option', { value: p, selected: p === a.entry }, p)));
 
   const del = h(
     'button',
@@ -657,7 +699,7 @@ async function viewDetail(id) {
           'div',
           { class: 'stats' },
           ...[
-            [t('detail.type'), a.kind === 'html' ? t('detail.kindHtml') : t('detail.kindFolder')],
+            [t('detail.type'), a.kind === 'folder' ? t('detail.kindFolder') : t(a.kind === 'markdown' ? 'detail.kindMarkdown' : 'detail.kindHtml')],
             [t('detail.version'), `v${a.current_version}`],
             [t('detail.files'), a.file_count],
             [t('detail.size'), fmtBytes(a.total_size)],
@@ -673,7 +715,7 @@ async function viewDetail(id) {
         h('h2', {}, t('detail.options')),
         h('label', { class: 'check' }, indexable, t('detail.indexable'), h('span', { class: 'muted small' }, t('detail.indexableHint'))),
         h('label', { class: 'check' }, spa, t('detail.spa'), h('span', { class: 'muted small' }, t('detail.spaHint'))),
-        htmlFiles.length > 1 ? h('label', { class: 'field' }, t('detail.entry'), entry) : null,
+        entryFiles.length > 1 ? h('label', { class: 'field' }, t('detail.entry'), entry) : null,
       ),
       h('div', { class: 'card stack' }, h('h2', {}, t('detail.uploadNew')), uploadPanel({ artifactId: id, currentEntry: a.entry, onDone: () => viewDetail(id) })),
       h('div', { class: 'card stack' }, h('h2', {}, t('detail.versions')), h('div', { class: 'table-wrap' }, h('table', { class: 'table' }, h('tbody', {}, versionRows)))),

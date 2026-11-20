@@ -1,6 +1,6 @@
 ---
 name: artifacts-share
-description: Publish or update HTML, built site directories, and ZIP bundles through the Artifacts Share API. Use when the user wants an Artifacts Share link, wants to find an existing artifact or version, or asks to change its private, public, or access-code sharing settings.
+description: Publish or update HTML, Markdown, built site directories, and ZIP bundles through the Artifacts Share API. Use when the user wants an Artifacts Share link, wants to find an existing artifact or version, or asks to change its private, public, or access-code sharing settings.
 ---
 
 # Artifacts Share
@@ -20,7 +20,7 @@ Keep the file outside the repository and restrict it to the account running the 
 
 ## Publish or update
 
-1. Identify the HTML file, ZIP, or built output directory the user wants to publish. For directories and ZIPs, run a dry run and review the manifest for unintended files or secrets. Build from source first when the user wants a runnable site.
+1. Identify the HTML or Markdown file, ZIP, or built output directory the user wants to publish. For directories and ZIPs, run a dry run and review the manifest for unintended files or secrets. Build from source first when the user wants a runnable site.
 2. Use the commands below with `<skill-dir>` replaced by the folder containing this file. New artifacts default to `private`. Pass `--visibility public` or `--visibility password` when the user requests that access. Set `--entry` only when the entry needs to be explicit. Set `--spa-fallback` for client-side routing when needed.
 3. For an update, pass the internal `id` from the authenticated API as `--artifact-id`. A share URL contains the public ID, which may differ from the internal ID after a link has been regenerated. If given a share URL or title, use `list --query` and follow `next_cursor` as needed. Match the exact `url` or `public_id` for links and resolve ambiguous title matches before writing. Leave visibility and other metadata unset to preserve them on updates.
 4. Return the API's `url`, current version, and visibility. A private link requires owner login. For access-code shares, use `--include-access-code` when the user wants the code or an auto-unlock link. Append `?pwd=<URL-encoded code>` only if requested.

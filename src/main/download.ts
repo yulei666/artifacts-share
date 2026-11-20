@@ -10,7 +10,7 @@ import type { AppContext, AppEnv } from './session';
 
 /**
  * Downloads from the share page. What you get follows the artifact type, like Claude artifacts:
- * a single HTML file downloads as that file; a multi-file artifact downloads as a ZIP of every file.
+ * HTML and Markdown single-file artifacts download their source; folders download as ZIPs.
  *
  * Who may download: the owner always; visitors only when `visitor_download_enabled` is on (default off),
  * and for access-code artifacts only with a short-lived token obtained by entering the code.
@@ -34,7 +34,7 @@ function fileName(title: string, fallback: string, ext: string): string {
   // eslint-disable-next-line no-control-regex
   const clean = title.replace(/[\\/:*?"<>|\x00-\x1f\x7f]/g, '_').replace(/\s+/g, ' ').trim();
   const base = Array.from(clean).slice(0, 100).join('') || fallback;
-  return base.toLowerCase().endsWith(ext) ? base : `${base}${ext}`;
+  return base.toLowerCase().endsWith(ext.toLowerCase()) ? base : `${base}${ext}`;
 }
 
 /** `attachment` with an ASCII fallback name plus the exact UTF-8 one (RFC 6266). */
@@ -47,12 +47,13 @@ export function disposition(name: string): string {
 
 /** What the download button will produce (shown in its label). */
 export async function downloadSummary(env: Env, a: ArtifactRow) {
-  if (a.kind === 'html') {
+  if (a.kind !== 'folder') {
     const f = await env.DB.prepare('SELECT size FROM artifact_files WHERE artifact_id = ? AND version = ? AND path = ?')
       .bind(a.id, a.current_version, a.entry)
       .first<{ size: number }>();
     const entryName = a.entry.split('/').pop()!;
-    return { kind: 'html' as const, name: fileName(a.title, entryName.replace(/\.html?$/i, ''), '.html'), size: f?.size ?? 0, file_count: 1 };
+    const ext = entryName.slice(entryName.lastIndexOf('.'));
+    return { kind: a.kind, name: fileName(a.title, entryName.slice(0, -ext.length), ext), size: f?.size ?? 0, file_count: 1 };
   }
   const v = await env.DB.prepare('SELECT file_count, total_size FROM artifact_versions WHERE artifact_id = ? AND version = ?')
     .bind(a.id, a.current_version)
@@ -66,7 +67,7 @@ export async function downloadInfo(env: Env, req: Request, a: ArtifactRow, owner
   if (access === 'denied') return null;
   if (access === 'code') {
     const captcha = (await captchaRequired(env, req, a)) ? { turnstile_site_key: env.TURNSTILE_SITE_KEY } : {};
-    return { kind: a.kind === 'html' ? 'html' : 'zip', needs_code: true, ...captcha };
+    return { kind: a.kind === 'folder' ? 'zip' : a.kind, needs_code: true, ...captcha };
   }
   return { ...(await downloadSummary(env, a)), needs_code: false };
 }
@@ -123,7 +124,7 @@ export function registerDownloadRoutes(
       'cache-control': 'private, no-store',
     });
 
-    if (summary.kind === 'html') {
+    if (summary.kind !== 'zip') {
       const obj = await c.env.BUCKET.get(r2Key(a.id, a.current_version!, a.entry));
       if (!obj) throw new HttpError(404, 'not_found', 'File not found');
       headers.set('content-type', 'application/octet-stream');

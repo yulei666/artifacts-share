@@ -1,5 +1,7 @@
+import { MARKDOWN_PREVIEW_MAX_BYTES, MARKDOWN_RAW_PARAM, markdownPage } from './markdown';
+import type { PageCtx } from './pages';
 import type { ArtifactRow, Env } from '../env';
-import { isHtmlPath } from '../lib/mime';
+import { contentTypeFor, isHtmlPath, isMarkdownPath } from '../lib/mime';
 import { requestPathToKey } from '../lib/paths';
 import { localPath } from '../lib/http';
 import { r2Key } from '../lib/store';
@@ -64,7 +66,7 @@ export async function serveFile(
   env: Env,
   ctx: ExecutionContext,
   a: ArtifactRow,
-  opts: { isPublic: boolean; ancestors: string; countView: boolean },
+  opts: PageCtx & { isPublic: boolean; countView: boolean },
 ): Promise<Response> {
   const { isPublic, ancestors } = opts;
   const url = new URL(req.url);
@@ -79,6 +81,9 @@ export async function serveFile(
   const trailing = url.pathname.endsWith('/') && key !== '';
   const path = key === '' ? a.entry : trailing ? `${key}/index.html` : key;
   const isHead = req.method === 'HEAD';
+  const markdown = isMarkdownPath(path);
+  const rawMarkdown = url.searchParams.get(MARKDOWN_RAW_PARAM);
+  const plainMarkdown = rawMarkdown === 'plain';
 
   // A view = a successful HTML page load (top-level, or in the share page's iframe), counted where a 200 HTML
   // response is actually sent — including edge-cache hits and SPA fallbacks; not 404s or redirects.
@@ -89,10 +94,27 @@ export async function serveFile(
     }
   };
 
+  // A reader response carries its source from the same authorized version snapshot.
+  if (path === a.entry && markdown && rawMarkdown === null
+    && (!dest || dest === 'document' || dest === 'iframe') && !req.headers.has('range')) {
+    const objectKey = r2Key(a.id, version, path);
+    const object = isHead ? await env.BUCKET.head(objectKey) : await env.BUCKET.get(objectKey);
+    if (object) {
+      let source: string | null = null;
+      if (!isHead) {
+        const body = object as R2ObjectBody;
+        if (body.size <= MARKDOWN_PREVIEW_MAX_BYTES) source = await body.text();
+        else await body.body.cancel();
+      }
+      countView();
+      return markdownPage(req, opts, baseHeaders(a, isPublic, ancestors), source);
+    }
+  }
+
   const conditional = ['if-match', 'if-unmodified-since', 'if-modified-since', 'if-range'].some((name) => req.headers.has(name));
   const cacheable = isPublic && req.method === 'GET' && !req.headers.has('range') && !conditional;
   // `indexable` changes response headers, so it is part of the key.
-  const cacheKey = new Request(`${url.origin}/__cache/v${version}/i${a.indexable}/${path.split('/').map(encodeURIComponent).join('/')}`);
+  const cacheKey = new Request(`${url.origin}/__cache/v${version}/i${a.indexable}${markdown ? (plainMarkdown ? '-markdown-plain' : '-markdown') : ''}/${path.split('/').map(encodeURIComponent).join('/')}`);
   if (cacheable) {
     const hit = await caches.default.match(cacheKey);
     if (hit) {
@@ -141,6 +163,11 @@ export async function serveFile(
     }
     const wantsHtml = (req.headers.get('accept') ?? '').includes('text/html') || !/\.[a-z0-9]+$/i.test(path);
     if (a.spa_fallback && wantsHtml) {
+      if (path !== a.entry && isMarkdownPath(a.entry)) {
+        // A Markdown document has a real directory for relative links and images.
+        const entry = '/' + a.entry.split('/').map(encodeURIComponent).join('/');
+        return new Response(null, { status: 302, headers: { location: entry + url.search, 'cache-control': 'no-store' } });
+      }
       obj = await load(a.entry, true);
       servedPath = a.entry;
     } else {
@@ -153,6 +180,11 @@ export async function serveFile(
 
   const headers = baseHeaders(a, isPublic, ancestors);
   obj.writeHttpMetadata(headers);
+  // Older .markdown uploads used the fallback MIME type in R2.
+  if (isMarkdownPath(servedPath)) {
+    headers.set('content-type', plainMarkdown ? 'text/plain; charset=utf-8' : contentTypeFor(servedPath));
+    headers.append('vary', 'sec-fetch-dest');
+  }
   headers.set('etag', obj.httpEtag);
   headers.set('last-modified', obj.uploaded.toUTCString());
   headers.set('accept-ranges', 'bytes');
