@@ -2199,6 +2199,21 @@ describe('Markdown shares', () => {
     expect(await route.text()).toBe('<h1>App</h1>');
   });
 
+  it.each([
+    [['index.markdown', 'index.md', 'README.md'], 'index.md'],
+    [['README.markdown', 'README.md'], 'README.md'],
+    [['README.md', 'INDEX.MARKDOWN'], 'INDEX.MARKDOWN'],
+  ])('uses the same Markdown index priority at the root and in subfolders (%j)', async (names, expected) => {
+    const form = new FormData();
+    for (const name of names) form.append('file', new File([notes], name));
+    for (const name of [...names].reverse()) form.append('file', new File([notes], `guide/${name}`));
+    const artifact = await json(await api('/api/v1/artifacts?visibility=public', { method: 'POST', body: form }), 201);
+    expect(artifact.entry).toBe(expected);
+    const directory = await page(`${artifact.content_url}guide/`);
+    expect(directory.status).toBe(302);
+    expect(directory.headers.get('location')).toBe(`/guide/${expected}`);
+  });
+
   it('offers large Markdown as plain source without buffering it into the reader', async () => {
     const { MARKDOWN_PREVIEW_MAX_BYTES } = await import('../src/content/markdown');
     const source = 'x'.repeat(MARKDOWN_PREVIEW_MAX_BYTES + 1);

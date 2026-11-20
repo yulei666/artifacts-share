@@ -1,4 +1,5 @@
 import { isHtmlPath, isMarkdownPath } from './mime';
+import { pickMarkdownIndex } from '../../web/markdown-index.js';
 
 export const RESERVED_PREFIX = '__share';
 const IGNORED = /(^|\/)(__MACOSX(\/|$)|\.DS_Store$|Thumbs\.db$)/;
@@ -47,8 +48,7 @@ export function inferEntry(paths: string[]): string | null {
   if (html.length === 1) return html[0];
   if (!html.length) {
     const markdown = paths.filter(isMarkdownPath);
-    const named = markdown.find((path) => /^index\.(?:md|markdown)$/i.test(path))
-      ?? markdown.find((path) => /^readme\.(?:md|markdown)$/i.test(path));
+    const named = pickMarkdownIndex(markdown);
     if (named || markdown.length === 1) return named ?? markdown[0];
   }
   return paths.length === 1 ? paths[0] : null;

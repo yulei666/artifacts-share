@@ -1,6 +1,7 @@
 // Artifacts Share — admin SPA (no build step; strict CSP compatible).
 import { errorText, lang, locale, t } from './i18n.js';
 import { act, ApiError, copy, fmtBytes, h, langToggle, mountTurnstile, request, toast, VISIBILITIES } from './ui.js';
+import { pickMarkdownIndex } from './markdown-index.js';
 
 // ---------------- helpers ----------------
 
@@ -443,9 +444,7 @@ function uploadPanel({ artifactId, currentEntry, onDone }) {
     const html = paths.filter((p) => /\.html?$/i.test(p));
     const markdown = paths.filter((p) => /\.(?:md|markdown)$/i.test(p));
     const current = paths.includes(currentEntry) ? currentEntry : null;
-    const preferredMarkdown = markdown.find((p) => /^index\.(?:md|markdown)$/i.test(p))
-      ?? markdown.find((p) => /^readme\.(?:md|markdown)$/i.test(p))
-      ?? (markdown.length === 1 ? markdown[0] : null);
+    const preferredMarkdown = pickMarkdownIndex(markdown) ?? (markdown.length === 1 ? markdown[0] : null);
     const preferred = current ?? (paths.includes('index.html') ? 'index.html' : null)
       ?? (html.length === 1 ? html[0] : null) ?? (!html.length ? preferredMarkdown : null)
       ?? (paths.length === 1 ? paths[0] : null);

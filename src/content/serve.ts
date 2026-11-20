@@ -5,11 +5,10 @@ import { contentTypeFor, isHtmlPath, isMarkdownPath } from '../lib/mime';
 import { requestPathToKey } from '../lib/paths';
 import { localPath } from '../lib/http';
 import { r2Key } from '../lib/store';
+import { MARKDOWN_INDEX_MAX_LENGTH, pickMarkdownIndex } from '../../web/markdown-index.js';
 
 const PUBLIC_BROWSER_CACHE = 'private, max-age=0, must-revalidate';
 const EDGE_CACHE_MAX_BYTES = 5 * 1024 * 1024;
-/** Directory index files for Markdown folders, matched case-insensitively in inferEntry's order. */
-const MARKDOWN_INDEXES = ['index.md', 'index.markdown', 'readme.md', 'readme.markdown'];
 
 function baseHeaders(a: ArtifactRow, isPublic: boolean, ancestors: string): Headers {
   const h = new Headers({
@@ -210,8 +209,8 @@ export async function serveFile(
         // `path >= dir AND path < dir-with-'/'-bumped-to-'0'` is an index range on the primary key.
         'SELECT path FROM artifact_files WHERE artifact_id = ? AND version = ? AND path >= ? AND path < ? AND substr(path, 1, ?) = ? '
         + 'AND length(path) - ? <= ? AND instr(substr(path, ? + 1), \'/\') = 0',
-      ).bind(a.id, version, dir, `${key}0`, dirLength, dir, dirLength, Math.max(...MARKDOWN_INDEXES.map((n) => n.length)), dirLength).all<{ path: string }>();
-      const found = MARKDOWN_INDEXES.map((name) => results.find((r) => r.path.slice(dir.length).toLowerCase() === name)?.path).find(Boolean);
+      ).bind(a.id, version, dir, `${key}0`, dirLength, dir, dirLength, MARKDOWN_INDEX_MAX_LENGTH, dirLength).all<{ path: string }>();
+      const found = pickMarkdownIndex(results.map(({ path }) => path), dir);
       if (found) {
         // Built from the stored path, so `guide//` cannot yield a doubled slash that shifts `../` links.
         const location = '/' + found.split('/').map(encodeURIComponent).join('/');

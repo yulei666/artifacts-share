@@ -295,7 +295,7 @@ a/{artifact_id}/v{version}/{path}
 - `/` 分隔，去掉前导 `./`、`/`；拒绝 `..`、空段、控制字符、`\`
 - 所有文件共享同一顶层目录时自动剥掉（如 `dist/`）
 - 禁止 `__share/` 前缀
-- 入口优先使用显式指定的 `entry`。上传新版本时，若未指定且原入口仍在，则沿用原入口。自动推断依次选择根目录 `index.html`、唯一的 HTML 文件。没有 HTML 时，优先选根目录的 `index.md` / `index.markdown`，其次是 `README.md` / `README.markdown`，再选唯一的 Markdown 文件。只有一个文件时可直接作为入口，其余情况需指定 `entry`。
+- 入口优先使用显式指定的 `entry`。上传新版本时，若未指定且原入口仍在，则沿用原入口。自动推断依次选择根目录 `index.html`、唯一的 HTML 文件。没有 HTML 时，根目录与子目录使用相同的 Markdown 索引顺序，依次匹配 `index.md`、`index.markdown`、`README.md`、`README.markdown`，忽略文件名大小写。没有索引时可选唯一的 Markdown 文件。只有一个文件时可直接作为入口，其余情况需指定 `entry`。
 - Content-Type 按扩展名查表，文本类追加 `; charset=utf-8`
 
 ### 4.3 zip 安全（开启时）
