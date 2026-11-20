@@ -88,6 +88,7 @@ async function copyCode(code) {
 function addCopyButtons() {
   const feedback = document.createElement('span');
   feedback.setAttribute('aria-hidden', 'true');
+  let announceFeedback;
   let clearFeedback;
   for (const code of article.querySelectorAll('pre > code')) {
     const pre = code.parentElement;
@@ -100,10 +101,13 @@ function addCopyButtons() {
     button.textContent = article.dataset.copy;
     button.addEventListener('click', async () => {
       const message = await copyCode(code);
+      clearTimeout(announceFeedback);
       clearTimeout(clearFeedback);
       toolbar.prepend(feedback);
       feedback.textContent = message;
-      copyStatus.textContent = message;
+      // Give assistive technology time to observe the empty region before repeating a message.
+      copyStatus.textContent = '';
+      announceFeedback = setTimeout(() => { copyStatus.textContent = message; }, 100);
       clearFeedback = setTimeout(() => {
         feedback.remove();
         copyStatus.textContent = '';
