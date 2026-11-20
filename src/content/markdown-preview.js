@@ -15,6 +15,9 @@ import yaml from 'highlight.js/lib/languages/yaml';
 import './markdown-preview.css';
 
 const MAX_RENDERED_DIAGRAMS = 20;
+const copyLabels = document.documentElement.lang === 'zh-CN'
+  ? { copy: '复制', copied: '已复制', failed: '复制失败，请手动复制' }
+  : { copy: 'Copy', copied: 'Copied', failed: 'Could not copy. Select the code to copy it manually.' };
 
 for (const [name, language] of Object.entries({ bash, css, go, javascript, json, markdown, python, sql, typescript, xml, yaml })) {
   hljs.registerLanguage(name, language);
@@ -44,6 +47,35 @@ function select(view) {
 
 for (const button of buttons) button.addEventListener('click', () => select(button.dataset.view));
 
+function addCopyButtons() {
+  for (const code of article.querySelectorAll('pre > code')) {
+    const pre = code.parentElement;
+    const block = document.createElement('div');
+    block.className = 'code-block';
+    const toolbar = document.createElement('div');
+    toolbar.className = 'code-toolbar';
+    const feedback = document.createElement('span');
+    feedback.setAttribute('role', 'status');
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = copyLabels.copy;
+    let clearFeedback;
+    button.addEventListener('click', async () => {
+      clearTimeout(clearFeedback);
+      try {
+        await navigator.clipboard.writeText(code.textContent);
+        feedback.textContent = copyLabels.copied;
+        clearFeedback = setTimeout(() => { feedback.textContent = ''; }, 2000);
+      } catch {
+        feedback.textContent = copyLabels.failed;
+      }
+    });
+    toolbar.append(feedback, button);
+    pre.replaceWith(block);
+    block.append(toolbar, pre);
+  }
+}
+
 async function renderDiagrams() {
   const diagrams = article.querySelectorAll('pre > code.language-mermaid');
   if (!diagrams.length) return;
@@ -63,7 +95,7 @@ async function renderDiagrams() {
       const figure = document.createElement('figure');
       figure.className = 'diagram';
       figure.innerHTML = svg;
-      code.parentElement.replaceWith(figure);
+      code.closest('.code-block').replaceWith(figure);
     } catch {
       // Keep the original code block when a diagram cannot be rendered.
     }
@@ -75,6 +107,7 @@ try {
   source.textContent = text;
   ready = true;
   article.innerHTML = parser.render(text);
+  addCopyButtons();
   const slugger = new GithubSlugger();
   for (const heading of article.querySelectorAll('h1, h2, h3, h4, h5, h6')) heading.id = slugger.slug(heading.textContent);
   rendered = true;
