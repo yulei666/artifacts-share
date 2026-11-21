@@ -18,6 +18,7 @@ const DICT = {
     'common.never': '从未',
     'common.untitled': '未命名',
     'common.loadMore': '加载更多',
+    'common.githubProject': 'GitHub 项目',
 
     'time.justNow': '刚刚',
     'time.minutes': '{n} 分钟前',
@@ -294,6 +295,7 @@ const DICT = {
     'common.never': 'never',
     'common.untitled': 'Untitled',
     'common.loadMore': 'Load more',
+    'common.githubProject': 'GitHub project',
 
     'time.justNow': 'just now',
     'time.minutes': '{n}m ago',
