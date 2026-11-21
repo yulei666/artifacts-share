@@ -1,11 +1,13 @@
 // Artifacts Share — admin SPA (no build step; strict CSP compatible).
 import { errorText, lang, locale, t } from './i18n.js';
-import { act, ApiError, copy, fmtBytes, h, langToggle, mountTurnstile, request, toast, VISIBILITIES } from './ui.js';
+import { act, ApiError, copy, fmtBytes, githubProjectLink, h, langToggle, mountTurnstile, request, toast, VISIBILITIES } from './ui.js';
 import { pickMarkdownIndex } from './markdown-index.js';
 
 // ---------------- helpers ----------------
 
 const $app = document.getElementById('app');
+const $footer = h('footer', { class: 'admin-footer', hidden: true });
+$app.after($footer);
 
 /** API call that also routes to sign-in / password setup when the server asks for it. */
 async function api(method, path, body) {
@@ -40,10 +42,11 @@ const langButton = (extraClass = '') =>
     render();
   });
 
-/** Static header text lives in index.html; translate it in place. */
+/** Refresh the header and footer when the UI language changes. */
 function applyChrome() {
   for (const el of document.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n);
   document.getElementById('lang-slot').replaceChildren(langButton());
+  $footer.replaceChildren(githubProjectLink());
 }
 
 // ---------------- router ----------------
@@ -66,7 +69,7 @@ async function render() {
   const top = document.getElementById('topbar');
 
   if (path === '/login') {
-    top.hidden = true;
+    top.hidden = $footer.hidden = true;
     return viewLogin(query);
   }
   if (!me) {
@@ -78,10 +81,10 @@ async function render() {
   }
   if (path === '/setup' && !me.needs_password_setup) return go('/');
   if (me.needs_password_setup) {
-    top.hidden = true;
+    top.hidden = $footer.hidden = true;
     return viewSetup();
   }
-  top.hidden = false;
+  top.hidden = $footer.hidden = false;
   const section = path.startsWith('/tokens') ? 'tokens' : path.startsWith('/settings') ? 'settings' : 'list';
   for (const a of top.querySelectorAll('[data-nav]')) a.classList.toggle('active', a.dataset.nav === section);
 
@@ -196,6 +199,7 @@ async function viewLogin(query) {
       sso.length ? h('div', { class: 'stack' }, sso) : null,
       !methods.password && !sso.length ? h('p', { class: 'muted' }, t('login.noMethods')) : null,
     ),
+    h('div', { class: 'login-project' }, githubProjectLink()),
   );
   user.focus();
   syncCaptcha().catch(() => toast(t('login.captchaLoadFailed'), 'error'));

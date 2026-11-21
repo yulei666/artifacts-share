@@ -1,6 +1,6 @@
 // Share viewer: top bar + sandboxed iframe of the artifact's own subdomain (like Claude artifacts).
 import { lang, t } from './i18n.js';
-import { act, copy, fmtBytes, h, langToggle, mountTurnstile, request, toast, VISIBILITIES } from './ui.js';
+import { act, copy, fmtBytes, githubProjectLink, h, langToggle, mountTurnstile, request, toast, VISIBILITIES } from './ui.js';
 
 const $bar = document.getElementById('vbar');
 const $main = document.getElementById('vmain');
@@ -376,7 +376,7 @@ function renderBar() {
     items.push(h('a', { class: 'btn sm hide-sm', href: rawUrl(), target: '_blank', rel: 'noopener', title: t('viewer.openRaw') }, '↗'));
     items.push(signInLink());
   }
-  items.push(langButton());
+  items.push(githubProjectLink({ iconOnly: true }), langButton());
   $bar.replaceChildren(...items);
 }
 
@@ -415,7 +415,7 @@ function renderFrame() {
 
 function renderNotFound() {
   document.title = `${t('viewer.notFoundTitle')} · Artifacts`;
-  $bar.replaceChildren(logo(), h('div', { class: 'vtitle' }, 'Artifacts'), signInLink(), langButton());
+  $bar.replaceChildren(logo(), h('div', { class: 'vtitle' }, 'Artifacts'), signInLink(), githubProjectLink({ iconOnly: true }), langButton());
   $main.replaceChildren(
     h(
       'div',
