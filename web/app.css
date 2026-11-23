@@ -97,6 +97,9 @@ button.sm, .btn.sm { padding: 4px 9px; font-size: 13px; }
 .github-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .github-link svg { flex: none; width: 16px; height: 16px; fill: currentColor; }
 .github-link-icon.btn.sm { flex: none; width: 32px; height: 30px; padding: 0; }
+.sso-btn { gap: 8px; }
+.sso-ico { flex: none; width: 17px; height: 17px; }
+.sso-ico-cloudflare { width: 20px; height: 20px; }
 
 input, select, textarea {
   font: inherit; color: var(--fg); background: var(--bg);
