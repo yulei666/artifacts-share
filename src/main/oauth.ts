@@ -247,7 +247,8 @@ async function finishCallback(env: Env, ref: URL, p: Provider, st: StateRow, bas
 
   const tokenRes = await fetch(ep.token, {
     method: 'POST',
-    redirect: 'error',
+    // Workers fetch only accepts 'follow' or 'manual' ('error' throws TypeError); reject 3xx explicitly below.
+    redirect: 'manual',
     headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
     body: new URLSearchParams({
       grant_type: 'authorization_code',
@@ -258,6 +259,10 @@ async function finishCallback(env: Env, ref: URL, p: Provider, st: StateRow, bas
       code_verifier: st.code_verifier,
     }),
   });
+  if (tokenRes.status >= 300 && tokenRes.status < 400) {
+    await tokenRes.body?.cancel();
+    throw Object.assign(new HttpError(400, 'sso_token', `Token endpoint redirected (${tokenRes.status})`), base);
+  }
   const tok = (await tokenRes.json().catch(() => ({}))) as { access_token?: string; id_token?: string; error?: string; error_description?: string };
   if (!tokenRes.ok || tok.error) throw Object.assign(new HttpError(400, 'sso_token', tok.error_description ?? tok.error ?? `Token exchange failed (${tokenRes.status})`), base);
 
