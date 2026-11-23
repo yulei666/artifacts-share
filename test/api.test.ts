@@ -1777,6 +1777,54 @@ describe('publishing and authentication consistency', () => {
     expect(await env.DB.prepare('SELECT 1 FROM oauth_states WHERE state = ?').bind(state).first()).toBeNull();
   });
 
+  it('exchanges an OAuth bind callback code without using unsupported RequestInit options and rejects token redirects', async () => {
+    const { setBinding } = await import('../src/main/oauth');
+    await json(
+      await api('/api/settings/sso/github', {
+        method: 'PUT',
+        auth: 'session',
+        headers: jsonHeaders,
+        body: JSON.stringify({ client_id: 'gh-client', client_secret: 'gh-secret', enabled: true }),
+      }),
+      200,
+    );
+    let tokenResponse = () => Response.json({ access_token: 'gh-access' });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      // Construct a real Workers Request so unsupported options (such as redirect: 'error') throw as in production.
+      const req = new Request(input, init);
+      if (req.url === 'https://github.com/login/oauth/access_token') {
+        expect(req.redirect).toBe('manual');
+        return tokenResponse();
+      }
+      if (req.url === 'https://api.github.com/user') {
+        expect(req.headers.get('authorization')).toBe('Bearer gh-access');
+        return Response.json({ id: 4242, login: 'octocat' });
+      }
+      throw new Error(`unexpected fetch: ${req.url}`);
+    });
+    try {
+      const start = await fetchRaw(`${MAIN}/api/auth/oauth/github/start?purpose=bind`, { headers: { cookie: session } });
+      const state = new URL(start.headers.get('location')!).searchParams.get('state')!;
+      const ok = await fetchRaw(`${MAIN}/api/auth/oauth/github/callback?state=${state}&code=good-code`, { headers: { cookie: session } });
+      expect(ok.status).toBe(302);
+      expect(ok.headers.get('location')).toBe('/#/settings?sso_bound=github');
+
+      const list = await json(await api('/api/settings/sso', { auth: 'session' }), 200);
+      expect(list.items.find((i: any) => i.provider === 'github')?.bound?.display).toBe('octocat');
+
+      tokenResponse = () => new Response(null, { status: 302, headers: { location: 'https://evil.example/steal' } });
+      const start2 = await fetchRaw(`${MAIN}/api/auth/oauth/github/start?purpose=bind`, { headers: { cookie: session } });
+      const state2 = new URL(start2.headers.get('location')!).searchParams.get('state')!;
+      const redirected = await fetchRaw(`${MAIN}/api/auth/oauth/github/callback?state=${state2}&code=redir-code`, { headers: { cookie: session } });
+      expect(redirected.status).toBe(302);
+      expect(redirected.headers.get('location')).toContain('sso_error=sso_token');
+      expect(redirected.headers.get('location')).toContain('Token%20endpoint%20redirected%20(302)');
+    } finally {
+      vi.restoreAllMocks();
+      await setBinding((await import('cloudflare:workers')).env, 'github', null, null);
+    }
+  });
+
   it('downloads an HTML artifact whose title reaches the filename limit with an emoji', async () => {
     const a = await createHtml('<p>unicode</p>', `?title=${encodeURIComponent('x'.repeat(99) + '😀')}`);
     const res = await fetchRaw(`${MAIN}/s/${a.public_id}/download`, { headers: { cookie: session } });
