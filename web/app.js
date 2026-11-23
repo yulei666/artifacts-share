@@ -1,6 +1,6 @@
 // Artifacts Share — admin SPA (no build step; strict CSP compatible).
 import { errorText, lang, locale, t } from './i18n.js';
-import { act, ApiError, copy, fmtBytes, githubProjectLink, h, langToggle, mountTurnstile, request, toast, VISIBILITIES } from './ui.js';
+import { act, ApiError, copy, fmtBytes, githubProjectLink, h, langToggle, mountTurnstile, request, ssoIcon, toast, VISIBILITIES } from './ui.js';
 import { pickMarkdownIndex } from './markdown-index.js';
 
 // ---------------- helpers ----------------
@@ -185,7 +185,12 @@ async function viewLogin(query) {
 
   const redirectTo = safeNext(next) || '/';
   const sso = methods.sso.map((s) =>
-    h('a', { class: 'btn', href: `/api/auth/oauth/${s.provider}/start?purpose=login&redirect_to=${encodeURIComponent(redirectTo)}` }, t('login.continueWith', { name: s.name })),
+    h(
+      'a',
+      { class: 'btn sso-btn', href: `/api/auth/oauth/${s.provider}/start?purpose=login&redirect_to=${encodeURIComponent(redirectTo)}` },
+      ssoIcon(s.provider),
+      t('login.continueWith', { name: s.name }),
+    ),
   );
 
   mount(
