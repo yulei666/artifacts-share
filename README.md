@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="web/icon.svg" width="64" height="64" alt="Artifacts Share">
+</p>
+
 # Artifacts Share
 
 类似 claude.ai Artifacts 的单用户分享系统，运行在一个 Cloudflare Worker 上（D1 + R2）。
@@ -11,6 +15,24 @@
 - API 用 Bearer Token 访问，Token 在后台管理
 
 设计细节见 [docs/DESIGN.md](docs/DESIGN.md)。
+
+## 界面预览
+
+### 分享预览页（Markdown 渲染 / Mermaid / 快捷分享弹窗）
+
+![分享预览页](docs/screenshots/share-viewer.png)
+
+### 管理后台 · Artifacts 列表
+
+![Artifacts 列表](docs/screenshots/artifacts-list.png)
+
+### Artifact 详情与权限 / 版本管理
+
+![Artifact 详情页](docs/screenshots/artifact-detail.png)
+
+### 登录页（密码 + Google / GitHub / Cloudflare SSO）
+
+![登录页](docs/screenshots/login.png)
 
 ## 部署
 

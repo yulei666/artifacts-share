@@ -81,6 +81,10 @@ function svgIcon(viewBox, paths, className) {
   return icon;
 }
 
+export function brandLogo() {
+  return h('img', { class: 'logo', src: '/icon.svg', alt: '' });
+}
+
 export function ssoIcon(provider) {
   const spec = SSO_ICONS[provider];
   return spec ? svgIcon(spec.viewBox, spec.paths, `sso-ico sso-ico-${provider}`) : null;

@@ -58,7 +58,8 @@ p { margin: 0; }
   border-bottom: 1px solid var(--line);
 }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 650; text-decoration: none; }
-.logo { width: 18px; height: 18px; border-radius: 5px; background: var(--accent); }
+.logo { display: block; flex: none; width: 20px; height: 20px; border-radius: 5px; }
+.card.center .logo { width: 24px; height: 24px; border-radius: 6px; }
 nav { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 nav a, nav .link { padding: 6px 10px; border-radius: 6px; text-decoration: none; color: var(--muted); }
 nav a:hover, nav .link:hover { color: var(--fg); background: var(--surface-2); }

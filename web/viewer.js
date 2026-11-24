@@ -1,6 +1,6 @@
 // Share viewer: top bar + sandboxed iframe of the artifact's own subdomain (like Claude artifacts).
 import { lang, t } from './i18n.js';
-import { act, copy, fmtBytes, githubProjectLink, h, langToggle, mountTurnstile, request, toast, VISIBILITIES } from './ui.js';
+import { act, brandLogo, copy, fmtBytes, githubProjectLink, h, langToggle, mountTurnstile, request, toast, VISIBILITIES } from './ui.js';
 
 const $bar = document.getElementById('vbar');
 const $main = document.getElementById('vmain');
@@ -337,7 +337,7 @@ window.addEventListener('resize', positionPopover);
 
 // ---------------- bar ----------------
 
-const logo = () => h('a', { class: 'brand', href: '/', title: 'Artifacts' }, h('span', { class: 'logo' }));
+const logo = () => h('a', { class: 'brand', href: '/', title: 'Artifacts', 'aria-label': 'Artifacts' }, brandLogo());
 const signInLink = () => h('a', { class: 'btn sm', href: `/#/login?next=${encodeURIComponent(location.pathname)}` }, t('viewer.signIn'));
 
 const langButton = () =>

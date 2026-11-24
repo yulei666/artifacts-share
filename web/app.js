@@ -1,6 +1,6 @@
 // Artifacts Share — admin SPA (no build step; strict CSP compatible).
 import { errorText, lang, locale, t } from './i18n.js';
-import { act, ApiError, copy, fmtBytes, githubProjectLink, h, langToggle, mountTurnstile, request, ssoIcon, toast, VISIBILITIES } from './ui.js';
+import { act, ApiError, brandLogo, copy, fmtBytes, githubProjectLink, h, langToggle, mountTurnstile, request, ssoIcon, toast, VISIBILITIES } from './ui.js';
 import { pickMarkdownIndex } from './markdown-index.js';
 
 // ---------------- helpers ----------------
@@ -197,7 +197,7 @@ async function viewLogin(query) {
     h(
       'div',
       { class: 'card center stack' },
-      h('div', { class: 'row' }, h('span', { class: 'logo' }), h('h1', { class: 'grow' }, t('login.title')), langButton('sm')),
+      h('div', { class: 'row' }, brandLogo(), h('h1', { class: 'grow' }, t('login.title')), langButton('sm')),
       error ? h('p', { class: 'err' }, errorText(error, query.get('detail') || error)) : null,
       methods.password ? form : null,
       methods.password && sso.length ? h('div', { class: 'divider' }) : null,
