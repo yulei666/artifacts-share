@@ -5,6 +5,7 @@ import { contentTypeFor, isHtmlPath, isMarkdownPath } from '../lib/mime';
 import { requestPathToKey } from '../lib/paths';
 import { localPath } from '../lib/http';
 import { r2Key } from '../lib/store';
+import { recordView } from '../lib/analytics';
 import { MARKDOWN_INDEX_MAX_LENGTH, pickMarkdownIndex } from '../../web/markdown-index.js';
 
 const PUBLIC_BROWSER_CACHE = 'private, max-age=0, must-revalidate';
@@ -112,9 +113,10 @@ export async function serveFile(
   // A view = a successful HTML page load (top-level, or in the share page's iframe), counted where a 200 HTML
   // response is actually sent — including edge-cache hits and SPA fallbacks; not 404s or redirects.
   const dest = req.headers.get('sec-fetch-dest');
-  const countView = () => {
+  const countView = (servedPath: string, bytes: number) => {
     if (opts.countView && !isHead && (!dest || dest === 'document' || dest === 'iframe')) {
       ctx.waitUntil(env.DB.prepare('UPDATE artifacts SET view_count = view_count + 1 WHERE id = ?').bind(a.id).run().catch(() => {}));
+      recordView(env, ctx, req, a, servedPath, bytes);
     }
   };
 
@@ -141,7 +143,7 @@ export async function serveFile(
         if (body.size <= MARKDOWN_PREVIEW_MAX_BYTES) source = await body.text();
         else await body.body.cancel();
       }
-      countView();
+      countView(path, body?.size ?? 0);
       return markdownPage(req, opts, headers, source, etag);
     }
   }
@@ -161,7 +163,7 @@ export async function serveFile(
         await hit.body?.cancel();
         return new Response(null, { status: 304, headers });
       }
-      if (isHtmlPath(path)) countView();
+      if (isHtmlPath(path)) countView(path, Number(headers.get('content-length') ?? 0) || 0);
       return new Response(hit.body, { status: hit.status, headers });
     }
   }
@@ -261,7 +263,7 @@ export async function serveFile(
     headers.set('content-range', rangeHeader(obj.range, obj.size));
   }
 
-  if (status === 200 && isHtmlPath(servedPath)) countView();
+  if (status === 200 && isHtmlPath(servedPath)) countView(servedPath, obj.size);
   const res = new Response((obj as R2ObjectBody).body, { status, headers });
   // Only small files go to the edge cache: clone() tees the body, and for a big file sent to a slow client the
   // runtime would buffer the difference in memory (128 MB isolate).

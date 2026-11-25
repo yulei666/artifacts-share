@@ -31,6 +31,11 @@ migrations_dir = "migrations"
 binding = "BUCKET"
 bucket_name = "artifacts-share"
 
+# Optional: Cloudflare Workers Analytics Engine (also set CF_ACCOUNT_ID + CF_API_TOKEN below)
+# [[analytics_engine_datasets]]
+# binding = "ANALYTICS"
+# dataset = "artifacts_share_events"
+
 [triggers]
 crons = ["17 3 * * *"]
 
@@ -42,8 +47,11 @@ CONTENT_HOST_SUFFIX = "-share"   # subdomain = {id}{suffix}.{CONTENT_ZONE}
 # Optional:
 # ADMIN_USERNAME = "admin"          # initial admin username (changeable in the admin UI)
 # TURNSTILE_SITE_KEY = "0x4AAA..."  # Cloudflare Turnstile on the login page (also set the secret below)
+# CF_ACCOUNT_ID = "..."             # Cloudflare Account ID for Analytics Engine SQL API queries
+# ANALYTICS_DATASET = "artifacts_share_events"  # optional override; must match [[analytics_engine_datasets]].dataset
 
 # Secrets (wrangler secret put <NAME>):
 #   SECRET_KEY                 random >= 32 bytes; derives signing + encryption keys
 #   ADMIN_BOOTSTRAP_PASSWORD   first-login password, replaced by the one you set in the admin UI
 #   TURNSTILE_SECRET_KEY       optional; with TURNSTILE_SITE_KEY, login requires Turnstile after 3 failures
+#   CF_API_TOKEN               optional; Account -> Account Analytics: Read token for Analytics Engine queries

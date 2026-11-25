@@ -13,6 +13,12 @@ export interface Env {
   /** Cloudflare Turnstile on the login page (both must be set to enable it). */
   TURNSTILE_SITE_KEY?: string;
   TURNSTILE_SECRET_KEY?: string;
+  /** Cloudflare Workers Analytics Engine (ANALYTICS binding + account ID + read API token all required). */
+  ANALYTICS?: AnalyticsEngineDataset;
+  CF_ACCOUNT_ID?: string;
+  CF_API_TOKEN?: string;
+  /** Override the Analytics Engine dataset name (defaults to 'artifacts_share_events'). */
+  ANALYTICS_DATASET?: string;
 }
 
 export type Visibility = 'private' | 'public' | 'password';

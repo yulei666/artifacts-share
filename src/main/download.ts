@@ -1,6 +1,7 @@
 import type { Hono } from 'hono';
 import type { ArtifactRow, Env } from '../env';
 import { captchaRequired, verifyAccessCode } from '../lib/access';
+import { recordDownload } from '../lib/analytics';
 import { signPayload, verifyPayload } from '../lib/crypto';
 import { HttpError, now, readJsonObject } from '../lib/http';
 import { getSettings } from '../lib/settings';
@@ -125,18 +126,23 @@ export function registerDownloadRoutes(
     });
 
     if (summary.kind !== 'zip') {
-      const obj = await c.env.BUCKET.get(r2Key(a.id, a.current_version!, a.entry));
+      const key = r2Key(a.id, a.current_version!, a.entry);
+      const obj = c.req.method === 'HEAD' ? await c.env.BUCKET.head(key) : await c.env.BUCKET.get(key);
       if (!obj) throw new HttpError(404, 'not_found', 'File not found');
       headers.set('content-type', 'application/octet-stream');
       headers.set('content-length', String(obj.size));
-      return new Response(obj.body, { headers });
+      if (c.req.method === 'HEAD') return new Response(null, { headers });
+      if (!v.owner && c.req.method === 'GET') recordDownload(c.env, c.executionCtx, c.req.raw, a, 'source', obj.size);
+      return new Response((obj as R2ObjectBody).body, { headers });
     }
 
+    headers.set('content-type', 'application/zip');
+    if (c.req.method === 'HEAD') return new Response(null, { headers });
     const { results } = await c.env.DB.prepare('SELECT path, size, content_type FROM artifact_files WHERE artifact_id = ? AND version = ? ORDER BY path')
       .bind(a.id, a.current_version)
       .all<ZipFile>();
     const ver = await c.env.DB.prepare('SELECT created_at FROM artifact_versions WHERE artifact_id = ? AND version = ?').bind(a.id, a.current_version).first<{ created_at: number }>();
-    headers.set('content-type', 'application/zip');
+    if (!v.owner && c.req.method === 'GET') recordDownload(c.env, c.executionCtx, c.req.raw, a, 'zip', summary.size);
     return new Response(streamZip(c.env, c.executionCtx, a.id, a.current_version!, results, new Date((ver?.created_at ?? now()) * 1000)), { headers });
   });
 }

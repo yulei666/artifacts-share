@@ -5,6 +5,7 @@ import { contentOrigin, isUuid } from '../lib/hosts';
 import { clientIp, HttpError, jsonError, now, readJsonObject, safeRelativePath } from '../lib/http';
 import { peekAttempts } from '../lib/ratelimit';
 import { guardedAttempt, loginBucket } from '../lib/access';
+import { analyticsEnabled, recordReferral } from '../lib/analytics';
 import { CAPTCHA_AFTER_FAILS, turnstileEnabled } from '../lib/turnstile';
 import { getInternal, getSettings, setInternal, updateSettings } from '../lib/settings';
 import { artifactView, getArtifact, getArtifactByPublicId, viewerUrl } from '../lib/store';
@@ -93,6 +94,7 @@ async function viewable(c: AppContext, publicId: string) {
 app.get('/s/:pid/', (c) => c.redirect(`/s/${encodeURIComponent(c.req.param('pid'))}${new URL(c.req.url).search}`, 301));
 app.get('/s/:pid', async (c) => {
   const v = await viewable(c, c.req.param('pid'));
+  if (v && !v.owner && c.req.method === 'GET') recordReferral(c.env, c.executionCtx, c.req.raw, v.a);
   const shell = await c.env.ASSETS.fetch(new Request(new URL('/viewer', c.req.url)));
   const res = new Response(shell.body, { status: v ? 200 : 404, headers: shell.headers });
   res.headers.set('cache-control', 'private, no-store');
@@ -194,8 +196,9 @@ app.post('/api/auth/logout-all', requireSession, async (c) => {
 app.get('/api/auth/me', async (c) => {
   const a = c.get('auth');
   if (!a) throw new HttpError(401, 'unauthorized', 'Not signed in');
-  if (a.type === 'token') return c.json({ type: 'token' });
-  return c.json({ type: 'session', method: a.method, needs_password_setup: a.method === 'bootstrap', username: await adminUsername(c.env) });
+  const analytics_enabled = analyticsEnabled(c.env);
+  if (a.type === 'token') return c.json({ type: 'token', analytics_enabled });
+  return c.json({ type: 'session', method: a.method, needs_password_setup: a.method === 'bootstrap', username: await adminUsername(c.env), analytics_enabled });
 });
 
 app.get('/api/auth/oauth/:provider/start', async (c) => {
