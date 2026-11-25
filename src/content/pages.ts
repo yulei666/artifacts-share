@@ -167,3 +167,37 @@ export function cookiesBlockedPage(ctx: PageCtx, openUrl: string): Response {
     200,
   );
 }
+
+/** Static script served at `/__share/unlocked.js` to notify the parent viewer and replace into the artifact. */
+export const UNLOCKED_SCRIPT = `(() => {
+  const el = document.currentScript;
+  if (!el) return;
+  const { origin, next, proof } = el.dataset;
+  if (origin && proof && window.parent && window.parent !== window) {
+    try { window.parent.postMessage({ type: 'as:unlocked', proof }, origin); } catch {}
+  }
+  if (next && next.startsWith('/') && !next.startsWith('//')) location.replace(next);
+})();
+`;
+
+/**
+ * Brief iframe-only hop after a visitor unlocks a password artifact: posts a signed proof to the parent
+ * viewer (so the top bar can reveal the real title) and immediately navigates to `next`.
+ */
+export function unlockNotifyPage(ctx: PageCtx, opts: { next: string; origin: string; proof: string }): Response {
+  const html = `<!doctype html><html lang="${ctx.lang === 'zh' ? 'zh-CN' : 'en'}"><head><meta charset="utf-8"><meta name="robots" content="noindex">
+<noscript><meta http-equiv="refresh" content="0;url=${esc(opts.next)}"></noscript>
+<style>html,body{margin:0;background:#f7f7f5}@media (prefers-color-scheme:dark){html,body{background:#191917}}</style>
+</head><body><script src="/__share/unlocked.js" data-origin="${esc(opts.origin)}" data-next="${esc(opts.next)}" data-proof="${esc(opts.proof)}"></script></body></html>`;
+  return new Response(html, {
+    status: 200,
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'private, no-store',
+      'content-security-policy': `default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; frame-ancestors ${ctx.ancestors}; base-uri 'none'`,
+      'referrer-policy': 'no-referrer',
+      'x-robots-tag': 'noindex, nofollow',
+      'x-content-type-options': 'nosniff',
+    },
+  });
+}

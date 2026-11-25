@@ -5,12 +5,14 @@ import { act, brandLogo, copy, fmtBytes, githubProjectLink, h, mountTurnstile, r
 const $bar = document.getElementById('vbar');
 const $main = document.getElementById('vmain');
 const publicId = location.pathname.split('/')[2] || '';
-/** Reserved parameter: tells the content gateway which language its own pages (unlock, errors) use. */
+/** Reserved parameters passed from the viewer to the content gateway (never handed to the artifact). */
 const LANG_PARAM = '__lang';
+const PROOF_PARAM = '__proof';
 
-// An access code in the share link goes to the iframe and is removed from the address bar.
-const pwd = new URLSearchParams(location.search).get('pwd');
-if (pwd) history.replaceState(null, '', location.pathname);
+// An access code in the share link is verified once for the viewer bar, passed to the iframe, and removed from the address bar.
+const rawPwd = new URLSearchParams(location.search).get('pwd');
+if (rawPwd) history.replaceState(null, '', location.pathname);
+let linkCode = rawPwd || null;
 
 // ---------------- helpers ----------------
 
@@ -66,9 +68,14 @@ function frameSrc() {
   const u = new URL(info.owner ? info.frame_url : info.content_url);
   // Only gateway pages (unlock, sign-in errors) need the language; public content never sees the parameter.
   if (info.owner || info.visibility === 'password') u.searchParams.set(LANG_PARAM, lang);
-  if (!info.owner && info.visibility === 'password' && pwd && !linkCodeSent) {
-    u.searchParams.set('pwd', pwd); // each submission counts against the attempt limit
-    linkCodeSent = true;
+  if (!info.owner && info.visibility === 'password') {
+    if (linkCode && !linkCodeSent) {
+      u.searchParams.set('pwd', linkCode); // each submission counts against the attempt limit
+      linkCodeSent = true;
+    } else if (info.title === null) {
+      // Self-heal: if this browser already unlocked on the content host, ask it for a signed proof.
+      u.searchParams.set(PROOF_PARAM, '1');
+    }
   }
   return u.toString();
 }
@@ -76,7 +83,7 @@ function frameSrc() {
 /** Raw subdomain link for "open in new tab" (owners hop through sign-in, visitors go straight there). */
 function rawUrl() {
   if (info.owner) return `/handoff?id=${info.public_id}&next=/`;
-  return pwd && info.visibility === 'password' ? `${info.content_url}?pwd=${encodeURIComponent(pwd)}` : info.content_url;
+  return linkCode && info.visibility === 'password' ? `${info.content_url}?pwd=${encodeURIComponent(linkCode)}` : info.content_url;
 }
 
 // ---------------- popovers & menu (share: owner; download: access-code visitors; menu: unified) ----------------
@@ -218,7 +225,7 @@ function downloadContent(error) {
     'aria-label': t('share.code'),
     placeholder: t('share.code'),
     class: 'code-input',
-    value: typedCode ?? pwd ?? '',
+    value: typedCode ?? linkCode ?? '',
     oninput: (e) => (typedCode = e.target.value),
   });
   const submit = h('button', { type: 'submit', class: 'sm primary' }, t('dl.submit'));
@@ -336,12 +343,12 @@ function onDownload(btn) {
       setMenuOpen(false, { restoreFocus: true });
     });
   }
-  if (pwd && !triedLinkCode) {
+  if (linkCode && !triedLinkCode) {
     // The share link carried the code: use it directly, fall back to asking if it no longer works.
     triedLinkCode = true;
     return act(btn, async () => {
       try {
-        await downloadWithCode(pwd);
+        await downloadWithCode(linkCode);
         setMenuOpen(false, { restoreFocus: true });
       } catch (e) {
         if (e.details?.turnstile_site_key) dlCaptchaKey = e.details.turnstile_site_key;
@@ -380,6 +387,39 @@ window.addEventListener('blur', () => {
   }, 0);
 });
 window.addEventListener('resize', positionPopover);
+
+async function tradeUnlockProof(proof) {
+  const path = `/api/public/artifacts/${encodeURIComponent(publicId)}/unlock`;
+  try {
+    return await api('POST', path, { proof });
+  } catch (err) {
+    if (err?.status >= 400 && err.status < 500) throw err;
+    return api('POST', path, { proof });
+  }
+}
+
+// Manual unlock inside the content iframe posts a short-lived signed proof; trade it for the real title.
+let unlockingProof = false;
+window.addEventListener('message', async (e) => {
+  if (!info || info.owner || info.visibility !== 'password' || info.title !== null) return;
+  if (!frame || e.source !== frame.contentWindow) return;
+  if (e.origin !== new URL(info.content_url).origin) return;
+  if (!e.data || e.data.type !== 'as:unlocked' || typeof e.data.proof !== 'string' || !e.data.proof) return;
+  if (unlockingProof) return;
+  unlockingProof = true;
+  try {
+    const r = await tradeUnlockProof(e.data.proof);
+    if (info && info.title === null) {
+      info.title = r.title;
+      renderBar();
+      if (frame) frame.title = info.title || 'Artifact';
+    }
+  } catch {
+    // Keep the protected placeholder if the proof is stale or the network hiccups.
+  } finally {
+    unlockingProof = false;
+  }
+});
 
 // ---------------- bar ----------------
 
@@ -438,7 +478,7 @@ function menuControl(entries) {
 }
 
 function renderBar() {
-  const title = info.title || (info.visibility === 'password' ? t('viewer.protected') : t('common.untitled'));
+  const title = info.title === null ? t('viewer.protected') : info.title || t('common.untitled');
   document.title = `${title} · Artifacts`;
   const items = [logo(), h('div', { class: 'vtitle', title }, title)];
   const menuEntries = [];
@@ -538,23 +578,45 @@ function renderNotFound() {
   );
 }
 
-async function refresh() {
+async function loadInfo() {
   info = await api('GET', `/api/public/artifacts/${encodeURIComponent(publicId)}`);
   dlCaptchaKey = info.download?.turnstile_site_key ?? dlCaptchaKey;
+}
+
+async function refresh() {
+  await loadInfo();
   renderBar();
   if (pop?.kind === 'download' && !info.download?.needs_code) closePopover();
   renderPopover();
 }
 
+async function unlockWithLinkCode() {
+  if (!info || info.owner || info.visibility !== 'password' || info.title !== null || !linkCode) return;
+  try {
+    const r = await api('POST', `/api/public/artifacts/${encodeURIComponent(publicId)}/unlock`, { code: linkCode });
+    info.title = r.title;
+  } catch (e) {
+    if (e.status === 404) throw e;
+    if (e.details?.turnstile_site_key) dlCaptchaKey = e.details.turnstile_site_key;
+    if (e.code === 'incorrect_code' || e.code === 'rate_limited') {
+      // Already counted against the shared attempt limit; don't resend the bad code to the iframe.
+      linkCode = null;
+      toast(e.message, 'error');
+    }
+  }
+}
+
 async function main() {
   document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
   try {
-    await refresh();
+    await loadInfo();
+    await unlockWithLinkCode();
   } catch (e) {
     if (e.status === 404) return renderNotFound();
     toast(e.message, 'error');
     return;
   }
+  renderBar();
   renderFrame();
 }
 

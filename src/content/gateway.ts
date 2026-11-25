@@ -4,17 +4,19 @@ import { mainOrigin } from '../lib/hosts';
 import { clearHostCookie, hostCookie, HttpError, localPath, now, parseCookies, readBodyLimited, safeRelativePath } from '../lib/http';
 import { type AttemptResult, captchaRequired, verifyAccessCode } from '../lib/access';
 import { getArtifactByPublicId } from '../lib/store';
-import { cookiesBlockedPage, errorPage, LANG_PARAM, type MessageKey, notFoundPage, type PageCtx, resolveLang, type UnlockError, unlockPage } from './pages';
+import { cookiesBlockedPage, errorPage, LANG_PARAM, type MessageKey, notFoundPage, type PageCtx, resolveLang, type UnlockError, UNLOCKED_SCRIPT, unlockNotifyPage, unlockPage } from './pages';
 import { markdownAsset } from './markdown';
 import { serveFile } from './serve';
 
 const OWNER_TTL = 12 * 3600;
 const UNLOCK_TTL = 7 * 24 * 3600;
+const UNLOCK_PROOF_TTL = 120;
 
 /** `sid` binds the owner cookie to the admin session: signing out (or out everywhere) revokes it at once. */
 interface OwnerClaim { k: 'owner'; id: string; sid: string; exp: number }
 interface UnlockClaim { k: 'unlock'; id: string; v: number; exp: number }
 export interface HandoffTicket { k: 'handoff'; id: string; sid: string; exp: number; n: string }
+export interface UnlockProof { k: 'unlock_proof'; id: string; v: number; exp: number }
 
 async function isOwner(env: Env, cookies: Record<string, string>, id: string): Promise<boolean> {
   const c = await verifyPayload<OwnerClaim>(env.SECRET_KEY, cookies['__Host-as_owner']);
@@ -58,12 +60,23 @@ export function pageCtx(env: Env, req: Request): PageCtx {
  * of looping back to the unlock page.
  */
 const CHECK_PARAM = '__chk';
+const PROOF_PARAM = '__proof';
 
 /** Path + query to return to, without the gateway's own parameters (they must never reach the artifact). */
 function returnPath(url: URL, drop: string[] = []): string {
   const q = new URLSearchParams(url.search);
-  for (const k of [LANG_PARAM, CHECK_PARAM, ...drop]) q.delete(k);
+  for (const k of [LANG_PARAM, CHECK_PARAM, PROOF_PARAM, ...drop]) q.delete(k);
   return localPath(url.pathname) + (q.size ? `?${q}` : '');
+}
+
+async function notifyUnlocked(env: Env, url: URL, ctx: PageCtx, a: ArtifactRow, next: string): Promise<Response> {
+  const proof = await signPayload(env.SECRET_KEY, {
+    k: 'unlock_proof',
+    id: a.public_id,
+    v: a.password_ver,
+    exp: now() + UNLOCK_PROOF_TTL,
+  } satisfies UnlockProof);
+  return unlockNotifyPage(ctx, { next, origin: mainOrigin(env, url), proof });
 }
 
 /**
@@ -96,7 +109,13 @@ export async function handleContent(req: Request, env: Env, execCtx: ExecutionCo
 
   if (url.searchParams.has(CHECK_PARAM)) {
     const allowed = owner || a.visibility === 'public' || (a.visibility === 'password' && (await isUnlocked(env, cookies, a)));
-    if (allowed) return redirect(returnPath(url, ['pwd']));
+    if (allowed) {
+      const next = returnPath(url, ['pwd']);
+      if (!owner && a.visibility === 'password' && req.method === 'GET' && req.headers.get('sec-fetch-dest') === 'iframe') {
+        return notifyUnlocked(env, url, ctx, a, next);
+      }
+      return redirect(next);
+    }
     // Private: look exactly like a normal miss (no existence oracle). Its "owner sign-in" link opens
     // top-level, where cookies are first-party, so a blocked-cookie owner still gets in.
     if (a.visibility === 'private') return notFoundPage(ctx, ownerLogin);
@@ -124,11 +143,15 @@ export async function handleContent(req: Request, env: Env, execCtx: ExecutionCo
     if (!(await isUnlocked(env, cookies, a))) {
       return renderUnlock(env, req, a, ctx, returnPath(url));
     }
+    // Self-heal: visitor already holds a valid content-host unlock cookie, but the viewer asked for a proof.
+    if (url.searchParams.has(PROOF_PARAM) && req.method === 'GET' && req.headers.get('sec-fetch-dest') === 'iframe') {
+      return notifyUnlocked(env, url, ctx, a, returnPath(url));
+    }
   }
 
-  // `__lang` (viewer → gateway pages) is a reserved, double-underscore name: never handed to the artifact.
+  // `__lang` / `__proof` (viewer → gateway) are reserved, double-underscore names: never handed to the artifact.
   // `pwd` is only reserved in password mode (handled above) — a public artifact may use it for itself.
-  if (url.searchParams.has(LANG_PARAM) || (a.visibility === 'password' && url.searchParams.has('pwd'))) {
+  if (url.searchParams.has(LANG_PARAM) || url.searchParams.has(PROOF_PARAM) || (a.visibility === 'password' && url.searchParams.has('pwd'))) {
     return redirect(returnPath(url, a.visibility === 'password' ? ['pwd'] : []));
   }
   // The owner's own previews are not views.
@@ -189,6 +212,16 @@ async function shareRoutes(req: Request, env: Env, id: string, url: URL, ctx: Pa
       const token = await signPayload(env.SECRET_KEY, { k: 'owner', id, sid: t.sid, exp: now() + OWNER_TTL } satisfies OwnerClaim);
       return redirect(withCheck(safeRelativePath(url.searchParams.get('next')), ctx), 302, [hostCookie('as_owner', token, OWNER_TTL, { embedded: true })]);
     }
+    case '/__share/unlocked.js':
+      if (req.method !== 'GET' && req.method !== 'HEAD') return new Response('Method not allowed', { status: 405, headers: { allow: 'GET, HEAD' } });
+      return new Response(req.method === 'HEAD' ? null : UNLOCKED_SCRIPT, {
+        headers: {
+          'content-type': 'text/javascript; charset=utf-8',
+          'cache-control': 'public, max-age=300',
+          'cross-origin-resource-policy': 'same-origin',
+          'x-content-type-options': 'nosniff',
+        },
+      });
     case '/__share/logout':
       return redirect('/', 302, [clearHostCookie('as_owner', { embedded: true }), clearHostCookie('as_unlock', { embedded: true })]);
     default:

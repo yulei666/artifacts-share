@@ -561,8 +561,10 @@ curl -X POST "$API/artifacts" -H "Authorization: Bearer $T" \
 - **iframe**：`src` 为内容子域名；`sandbox` 允许脚本、表单、弹窗、下载等，但只允许由用户点击触发的顶层跳转（`allow-top-navigation-by-user-activation`），artifact 不能悄悄把分享页跳转到别的网站。
 - **只允许主域名嵌入**：内容子域名的所有响应都带 `Content-Security-Policy: frame-ancestors 'self' https://share.example.com`；主域名的 CSP 用 `frame-src https://*.example-content.com` 允许加载 iframe。
 - **iframe 内的 Cookie**：内容子域名与主域名跨站，`SameSite=Lax` 的 Cookie 在 iframe 中不会发送。因此解锁 / 所有者 Cookie 使用 `SameSite=None; Partitioned`（CHIPS），按顶层站点分区：在分享页里解锁后，只在分享页里有效；直接访问子域名需要单独解锁。
-- **元数据接口** `GET /api/public/artifacts/{public_id}`（无需登录）：
-  - 访客：私有返回 404；访问码模式不返回标题；只返回 iframe 本来就会展示的信息。
+- **元数据接口** `GET /api/public/artifacts/{public_id}`（无需登录）与 `POST /api/public/artifacts/{public_id}/unlock`：
+  - 访客：私有返回 404；访问码模式在未验证前不返回标题（`title: null`）；只返回 iframe 本来就会展示的信息。
+  - 带 `?pwd=` 打开访问码链接时，分享页先以 `application/json` 调用 `POST /api/public/artifacts/{public_id}/unlock`（非 JSON 返回 415；与子域名共用限流计数）；校验通过后返回真实标题并写入主域名签名 Cookie `__Host-as_unlock_meta`（`HttpOnly; Secure; SameSite=Lax`，最多保留最近 20 条，绑定 `password_ver`，7 天有效，退出登录时清空），使刷新页面后仍保留真实标题，重置访问码立即失效；若访问码错误则不再把错误码传给 iframe，避免双倍扣次。
+  - 在 iframe 内手动输入访问码解锁后（或已有内容子域名解锁 Cookie 而主域名尚未记录时由分享页携带保留参数 `__proof=1` 触发自愈），内容子域名仅对访客的 `GET` iframe 请求返回严格 CSP（`script-src 'self'`）的极简跳板页（所有者、`HEAD` 与顶层打开仍走原生 `302`）：加载静态脚本 `/__share/unlocked.js`（带 `CORP: same-origin`），通过 `postMessage` 向主域名发送短效签名回执（`k: 'unlock_proof'`，2 分钟有效，绑定 `public_id` 与 `password_ver`）后立即 `location.replace` 进入内容页；分享页校验 `e.source` 与 `e.origin` 后换取真实标题（遇瞬时非 4xx 错误自动重试一次）并写入 `__Host-as_unlock_meta`。
   - 所有者：另外返回完整的 artifact 信息，以及 `frame_url`（一次性登录票据地址）。iframe 用它先在子域名上登录，私有 / 访问码内容直接可见。
 - **工具栏**：所有人可以复制链接、在新标签页打开、登录。所有者看到一个"分享"按钮（图标显示当前权限），点开是类似 Claude 的弹出面板：三种权限选项（带图标和说明）、访问码（复制 / 重新生成）、链接与"复制链接 + 访问码"。面板在点击外部、按 Esc、点进 iframe 时关闭。工具栏上另有进入管理页、退出登录。
 - **语言统一**：分享页把自己的界面语言用保留参数 `__lang` 传给 iframe，只在 iframe 会显示网关页面时才带上（访问码页、所有者登录跳转），公开内容不会收到这个参数。访问码表单里也带着语言，输错后重新显示时语言不变。网关的所有跳转都会去掉 `__lang`，它不会传到 artifact 自己的页面。退出登录时先让 iframe 访问 `/__share/logout`，清掉子域名上的所有者 Cookie，再退出主域名会话。
