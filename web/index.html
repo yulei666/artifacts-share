@@ -12,14 +12,22 @@
 <body class="admin-shell">
   <header class="topbar" id="topbar" hidden>
     <a class="brand" href="#/"><img class="logo" src="/icon.svg" alt="">Artifacts</a>
-    <nav>
-      <a href="#/" data-nav="list" data-i18n="nav.artifacts"></a>
-      <a href="#/analytics" data-nav="analytics" data-i18n="nav.analytics" hidden></a>
-      <a href="#/tokens" data-nav="tokens" data-i18n="nav.tokens"></a>
-      <a href="#/settings" data-nav="settings" data-i18n="nav.settings"></a>
-      <span id="lang-slot"></span>
-      <button class="link" id="logout" data-i18n="nav.signOut"></button>
-    </nav>
+    <div class="topbar-actions" id="topbar-actions">
+      <span class="lang-slot lang-slot-mobile"></span>
+      <button type="button" class="icon-btn nav-toggle" id="nav-toggle" aria-expanded="false" aria-controls="topbar-nav" aria-label="Menu">
+        <svg class="ico ico-menu" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        <svg class="ico ico-close" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6l-12 12"/></svg>
+      </button>
+      <nav id="topbar-nav">
+        <a href="#/" data-nav="list" data-i18n="nav.artifacts"></a>
+        <a href="#/analytics" data-nav="analytics" data-i18n="nav.analytics" hidden></a>
+        <a href="#/tokens" data-nav="tokens" data-i18n="nav.tokens"></a>
+        <a href="#/settings" data-nav="settings" data-i18n="nav.settings"></a>
+        <span class="lang-slot lang-slot-desktop"></span>
+        <span class="nav-sep" aria-hidden="true"></span>
+        <button class="link nav-signout" id="logout" data-i18n="nav.signOut"></button>
+      </nav>
+    </div>
   </header>
   <main id="app"></main>
   <div id="toasts" aria-live="polite"></div>

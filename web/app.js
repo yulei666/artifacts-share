@@ -43,10 +43,21 @@ const langButton = (extraClass = '') =>
     render();
   });
 
+const $topbar = document.getElementById('topbar');
+const $topbarActions = document.getElementById('topbar-actions');
+const $topbarNav = document.getElementById('topbar-nav');
+const $navToggle = document.getElementById('nav-toggle');
+
+function setMenuOpen(open) {
+  $topbar.classList.toggle('menu-open', open);
+  $navToggle?.setAttribute('aria-expanded', String(open));
+}
+
 /** Refresh the header and footer when the UI language changes. */
 function applyChrome() {
   for (const el of document.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n);
-  document.getElementById('lang-slot').replaceChildren(langButton());
+  for (const slot of document.querySelectorAll('.lang-slot')) slot.replaceChildren(langButton());
+  $navToggle?.setAttribute('aria-label', t('nav.menu'));
   $footer.replaceChildren(githubProjectLink());
 }
 
@@ -66,8 +77,9 @@ function go(path) {
 let me = null;
 
 async function render() {
+  setMenuOpen(false);
   const { path, query } = parseHash();
-  const top = document.getElementById('topbar');
+  const top = $topbar;
 
   if (path === '/login') {
     top.hidden = $footer.hidden = true;
@@ -107,6 +119,28 @@ function mount(...nodes) {
 }
 
 window.addEventListener('hashchange', render);
+$navToggle?.addEventListener('click', () => setMenuOpen(!$topbar.classList.contains('menu-open')));
+$topbarNav?.addEventListener('click', (e) => {
+  if (e.target.closest('a, button')) setMenuOpen(false);
+});
+$topbarActions?.addEventListener('focusout', (e) => {
+  if ($topbar.classList.contains('menu-open') && e.relatedTarget && !$topbarActions.contains(e.relatedTarget)) {
+    setMenuOpen(false);
+  }
+});
+document.addEventListener('pointerdown', (e) => {
+  if ($topbar.classList.contains('menu-open') && !$topbarNav?.contains(e.target) && !$navToggle?.contains(e.target)) {
+    setMenuOpen(false);
+  }
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !e.defaultPrevented && $topbar.classList.contains('menu-open')) {
+    const returnFocus = $topbarActions?.contains(document.activeElement);
+    setMenuOpen(false);
+    if (returnFocus) $navToggle?.focus();
+  }
+});
+window.matchMedia?.('(max-width: 640px)').addEventListener?.('change', () => setMenuOpen(false));
 document.getElementById('logout').addEventListener('click', async () => {
   await api('POST', '/api/auth/logout').catch(() => {});
   me = null;
