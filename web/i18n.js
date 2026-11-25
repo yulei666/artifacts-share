@@ -7,6 +7,7 @@ const DICT = {
     'nav.tokens': 'API 令牌',
     'nav.settings': '设置',
     'nav.signOut': '退出登录',
+    'nav.menu': '菜单',
     'lang.switch': 'EN',
     'lang.switchTitle': 'Switch to English',
 
@@ -327,6 +328,7 @@ const DICT = {
     'nav.tokens': 'API tokens',
     'nav.settings': 'Settings',
     'nav.signOut': 'Sign out',
+    'nav.menu': 'Menu',
     'lang.switch': '中文',
     'lang.switchTitle': '切换到中文',
 
