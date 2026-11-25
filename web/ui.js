@@ -90,11 +90,11 @@ export function ssoIcon(provider) {
   return spec ? svgIcon(spec.viewBox, spec.paths, `sso-ico sso-ico-${provider}`) : null;
 }
 
-export function githubProjectLink({ iconOnly = false } = {}) {
+export function githubProjectLink({ iconOnly = false, className = '' } = {}) {
   const label = t('common.githubProject');
   const icon = svgIcon('0 0 16 16', [{ d: GITHUB_MARK }]);
   return h('a', {
-    class: iconOnly ? 'github-link btn sm github-link-icon' : 'github-link',
+    class: className || (iconOnly ? 'github-link btn sm github-link-icon' : 'github-link'),
     href: 'https://github.com/yulei666/artifacts-share',
     target: '_blank',
     rel: 'noopener noreferrer',

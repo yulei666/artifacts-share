@@ -9,6 +9,7 @@ const DICT = {
     'nav.signOut': '退出登录',
     'nav.menu': '菜单',
     'lang.switch': 'EN',
+    'lang.switchFull': 'English',
     'lang.switchTitle': 'Switch to English',
 
     'common.copied': '已复制',
@@ -330,6 +331,7 @@ const DICT = {
     'nav.signOut': 'Sign out',
     'nav.menu': 'Menu',
     'lang.switch': '中文',
+    'lang.switchFull': '中文',
     'lang.switchTitle': '切换到中文',
 
     'common.copied': 'Copied',
