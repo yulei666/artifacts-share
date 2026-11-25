@@ -495,6 +495,8 @@ Base：`https://share.example.com`
 | `GET` | `/api/v1/artifacts/{id}/files?version=` | 文件清单 |
 | `GET` | `/api/v1/artifacts/{id}/files/{path}` | 下载原文件 |
 | `DELETE` | `/api/v1/artifacts/{id}` | 软删除 |
+| `GET` | `/api/v1/analytics?range=7d&tz=480&bots=0` | 全站访问统计（未配置 Analytics Engine 时返回 `{ enabled: false }`） |
+| `GET` | `/api/v1/artifacts/{id}/analytics?range=7d&tz=480&bots=0` | 单作品 90 天内访问明细（`range`: `24h\|7d\|30d\|90d`，`tz`: 分钟偏移 `[-720,840]`，`bots`: `0\|1`） |
 
 ### 8.2 分批上传（Token / 会话）
 
@@ -581,6 +583,7 @@ curl -X POST "$API/artifacts" -H "Authorization: Bearer $T" \
 - **新建 / 更新**：拖拽 HTML / 文件夹 / zip，粘贴 HTML 文本，进度条，选可见性
 - **详情**：链接复制、打开（私有自动 handoff）；可见性切换；访问码查看 / 复制 / 重置；允许收录开关（仅 public）；文件树；版本历史与回滚；删除
 - **API Tokens**：新建（仅显示一次）、列表、吊销
+- **访问统计（可选）**：当 `ANALYTICS` 绑定、`CF_ACCOUNT_ID` 和 `CF_API_TOKEN`（Account Analytics: Read）均已配置时启用。访客浏览（HTML / Markdown）、下载（`source` / `zip`）和分享页外链来源（`referral`）通过 `writeDataPoint` 非阻塞写入 Workers Analytics Engine（按内部 `artifact.id` 索引，匿名月度 HMAC `visitor_id` 去重，不存明文 IP）；管理端顶栏提供全站统计页（`#/analytics`），详情页提供按需展开的折叠分析卡片，未配置或数据集未初始化时优雅降级。
 - **设置**
   - 通用：默认可见性、保留版本数、上传上限
   - 上传：**服务端 zip 解压开关（默认关）**及上限

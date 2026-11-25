@@ -104,6 +104,27 @@ npx wrangler secret put TURNSTILE_SECRET_KEY
 
 > `SECRET_KEY` 用于派生签名和加密密钥。更换它会让所有登录、访问码解锁失效，并需要重新填写 SSO client secret、重置所有访问码。
 
+### 可选：访问统计（Workers Analytics Engine）
+
+如需要时间趋势、独立访客（UV）、来源域名、地区、设备与下载统计，可在 `wrangler.toml` 开启 Analytics Engine 绑定并配置只读查询 Token（三项齐全时启用，缺任一项则自动隐藏统计入口）：
+
+```toml
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "artifacts_share_events"
+
+# 添加到现有的 [vars] 段中：
+CF_ACCOUNT_ID = "你的 Cloudflare Account ID"
+# ANALYTICS_DATASET = "artifacts_share_events"   # 可选，需与上方 dataset 一致
+```
+
+```bash
+# 自定义 Token 只需最小权限：Account → Account Analytics: Read
+npx wrangler secret put CF_API_TOKEN
+```
+
+启用后顶栏会出现 **统计**（`#/analytics`）全站分析页，每个 artifact 详情页也会提供按需展开的 **访问统计** 折叠卡片（保留近 90 天明细；D1 的 `view_count` 继续作为永久累计浏览数）。
+
 ## SSO 配置
 
 在后台 **Settings → Single sign-on** 中，每张卡片都显示回调地址，复制后到对应平台创建应用：

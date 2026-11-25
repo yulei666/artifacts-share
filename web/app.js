@@ -2,6 +2,7 @@
 import { errorText, lang, locale, t } from './i18n.js';
 import { act, ApiError, brandLogo, copy, fmtBytes, githubProjectLink, h, langToggle, mountTurnstile, request, ssoIcon, toast, VISIBILITIES } from './ui.js';
 import { pickMarkdownIndex } from './markdown-index.js';
+import { createAnalyticsPanel } from './analytics.js';
 
 // ---------------- helpers ----------------
 
@@ -85,11 +86,14 @@ async function render() {
     return viewSetup();
   }
   top.hidden = $footer.hidden = false;
-  const section = path.startsWith('/tokens') ? 'tokens' : path.startsWith('/settings') ? 'settings' : 'list';
+  const navAnalytics = top.querySelector('[data-nav="analytics"]');
+  if (navAnalytics) navAnalytics.hidden = !me.analytics_enabled;
+  const section = path.startsWith('/analytics') ? 'analytics' : path.startsWith('/tokens') ? 'tokens' : path.startsWith('/settings') ? 'settings' : 'list';
   for (const a of top.querySelectorAll('[data-nav]')) a.classList.toggle('active', a.dataset.nav === section);
 
   let m;
   if (path === '/' || path === '') return viewList();
+  if (path === '/analytics') return me.analytics_enabled ? viewAnalytics() : go('/');
   if (path === '/new') return viewNew();
   if ((m = /^\/a\/([0-9a-f-]{36})$/.exec(path))) return viewDetail(m[1]);
   if (path === '/tokens') return viewTokens();
@@ -314,6 +318,20 @@ async function viewList() {
     h('div', { class: 'stack' }, h('div', { class: 'row' }, h('div', { class: 'grow' }, search), vis), wrap, empty, h('div', { class: 'row' }, more)),
   );
   await load(true).catch((e) => toast(e.message, 'error'));
+}
+
+// ---------------- analytics ----------------
+
+function viewAnalytics() {
+  const panel = createAnalyticsPanel({
+    api,
+    onNavigateArtifact: (id) => go(`/a/${id}`),
+  });
+  mount(
+    h('div', { class: 'page-head' }, h('h1', {}, t('analytics.title')), panel.controls),
+    panel.root,
+  );
+  panel.load();
 }
 
 // ---------------- upload ----------------
@@ -693,6 +711,35 @@ async function viewDetail(id) {
     ),
   );
 
+  let analyticsCard = null;
+  if (me?.analytics_enabled) {
+    let loaded = false;
+    const hint = h('span', { class: 'muted small an-summary-hint' }, t('analytics.detailHint'));
+    const body = h('div', { class: 'an-detail-body' });
+    analyticsCard = h(
+      'details',
+      { class: 'card an-details' },
+      h('summary', {}, h('span', { class: 'an-summary-left' }, h('strong', {}, t('analytics.title'))), hint),
+      body,
+    );
+    analyticsCard.addEventListener('toggle', () => {
+      if (analyticsCard.open && !loaded) {
+        loaded = true;
+        const panel = createAnalyticsPanel({
+          api,
+          artifactId: id,
+          kind: a.kind,
+          onRangeChange: (r) => {
+            hint.textContent = t(`analytics.range.${r}`);
+          },
+        });
+        body.replaceChildren(h('div', { class: 'an-detail-head' }, panel.controls), panel.root);
+        hint.textContent = t(`analytics.range.${panel.getRange()}`);
+        panel.load();
+      }
+    });
+  }
+
   mount(
     h('div', { class: 'page-head' }, h('div', { class: 'row' }, h('a', { href: '#/', class: 'muted' }, t('detail.back'))), h('a', { class: 'btn primary', href: openUrl, target: '_blank', rel: 'noopener' }, t('detail.open'))),
     h(
@@ -725,6 +772,7 @@ async function viewDetail(id) {
         h('label', { class: 'check' }, spa, t('detail.spa'), h('span', { class: 'muted small' }, t('detail.spaHint'))),
         entryFiles.length > 1 ? h('label', { class: 'field' }, t('detail.entry'), entry) : null,
       ),
+      analyticsCard,
       h('div', { class: 'card stack' }, h('h2', {}, t('detail.uploadNew')), uploadPanel({ artifactId: id, currentEntry: a.entry, onDone: () => viewDetail(id) })),
       h('div', { class: 'card stack' }, h('h2', {}, t('detail.versions')), h('div', { class: 'table-wrap' }, h('table', { class: 'table' }, h('tbody', {}, versionRows)))),
       h(

@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { ArtifactRow } from '../env';
 import { isUuid } from '../lib/hosts';
 import { disposition } from './download';
+import { parseAnalyticsParams, queryAnalytics } from '../lib/analytics';
 import { HttpError, now, readBodyLimited, readJsonObject } from '../lib/http';
 import { getSettings, type Settings } from '../lib/settings';
 import {
@@ -274,6 +275,19 @@ api.delete('/artifacts/:id', async (c) => {
   await softDeleteArtifact(c.env, id);
   c.executionCtx.waitUntil(purgeArtifact(c.env, id).catch((e) => console.error('purge failed', id, e)));
   return c.body(null, 204);
+});
+
+// ---------- analytics ----------
+
+api.get('/analytics', async (c) => {
+  const opts = parseAnalyticsParams(new URL(c.req.url));
+  return c.json(await queryAnalytics(c.env, opts));
+});
+
+api.get('/artifacts/:id/analytics', async (c) => {
+  const a = await requireArtifact(c.env, idParam(c));
+  const opts = parseAnalyticsParams(new URL(c.req.url));
+  return c.json(await queryAnalytics(c.env, { ...opts, artifact: a }));
 });
 
 // ---------- upload sessions ----------
