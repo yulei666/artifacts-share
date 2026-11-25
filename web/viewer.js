@@ -1,6 +1,6 @@
 // Share viewer: top bar + sandboxed iframe of the artifact's own subdomain (like Claude artifacts).
-import { lang, t } from './i18n.js';
-import { act, brandLogo, copy, fmtBytes, githubProjectLink, h, langToggle, mountTurnstile, request, toast, VISIBILITIES } from './ui.js';
+import { lang, setLang, t } from './i18n.js';
+import { act, brandLogo, copy, fmtBytes, githubProjectLink, h, mountTurnstile, request, toast, VISIBILITIES } from './ui.js';
 
 const $bar = document.getElementById('vbar');
 const $main = document.getElementById('vmain');
@@ -24,6 +24,13 @@ const ICONS = {
   check: ['M5 12.5l4.5 4.5L19 7'],
   chevron: ['M7 10l5 5 5-5'],
   download: ['M12 4v11', 'M7.5 10.5L12 15l4.5-4.5', 'M5 20h14'],
+  external: ['M7 17L17 7', 'M9 7h8v8'],
+  manage: [
+    'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
+    'M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z',
+  ],
+  menu: ['M4 7h16', 'M4 12h16', 'M4 17h16'],
+  close: ['M6 6l12 12', 'M18 6l-12 12'],
 };
 function icon(name, cls = 'ico') {
   const svg = document.createElementNS(SVG_NS, 'svg');
@@ -46,7 +53,10 @@ let info = null; // response of /api/public/artifacts/:id
 let frame = null;
 let pop = null; // open popover: { el, kind: 'share' | 'download' }
 let shareBtn = null;
-let dlBtn = null;
+let menuOpen = false;
+let menuWrap = null;
+let menuBtn = null;
+let menuPanel = null;
 let triedLinkCode = false; // a ?pwd= code is tried once for downloads before asking
 
 let linkCodeSent = false; // the ?pwd= code goes to the iframe once; reloads (e.g. a language switch) don't resend it
@@ -69,16 +79,29 @@ function rawUrl() {
   return pwd && info.visibility === 'password' ? `${info.content_url}?pwd=${encodeURIComponent(pwd)}` : info.content_url;
 }
 
-// ---------------- popovers (share: owner; download: access-code visitors) ----------------
+// ---------------- popovers & menu (share: owner; download: access-code visitors; menu: unified) ----------------
 
-const anchorOf = (kind) => (kind === 'share' ? shareBtn : dlBtn);
+const anchorOf = (kind) => (kind === 'share' ? shareBtn : menuBtn);
+const syncOverlay = () => document.body.classList.toggle('overlay-open', !!(menuOpen || pop));
+
+function setMenuOpen(open, { restoreFocus = false } = {}) {
+  if (open) closePopover();
+  const wasOpen = menuOpen;
+  const hadFocus = menuWrap?.contains(document.activeElement) || document.activeElement === document.body;
+  menuOpen = !!open;
+  menuWrap?.classList.toggle('open', menuOpen);
+  menuBtn?.setAttribute('aria-expanded', String(menuOpen));
+  syncOverlay();
+  if (!menuOpen && wasOpen && restoreFocus && hadFocus) menuBtn?.focus();
+}
 
 function closePopover() {
   if (!pop) return;
   dropDownloadWidget();
   pop.el.remove();
-  anchorOf(pop.kind)?.setAttribute('aria-expanded', 'false');
+  if (pop.kind === 'share') shareBtn?.setAttribute('aria-expanded', 'false');
   pop = null;
+  syncOverlay();
 }
 
 function positionPopover() {
@@ -253,10 +276,12 @@ function renderPopover(error) {
 }
 
 function openPopover(kind, error) {
+  setMenuOpen(false);
   closePopover();
   pop = { kind, el: h('div', { class: 'popover', role: 'dialog', 'aria-label': kind === 'share' ? t('share.title') : t('viewer.download') }) };
   document.body.append(pop.el);
-  anchorOf(kind)?.setAttribute('aria-expanded', 'true');
+  if (kind === 'share') shareBtn?.setAttribute('aria-expanded', 'true');
+  syncOverlay();
   renderPopover(error);
   pop.el.querySelector(kind === 'share' ? '.pop-opt.on' : 'input')?.focus();
 }
@@ -266,13 +291,17 @@ const togglePopover = (kind) => (pop?.kind === kind ? closePopover() : openPopov
 // Close on outside click, Escape, or focus moving into the iframe (its clicks never reach this document).
 document.addEventListener('pointerdown', (e) => {
   if (pop && !pop.el.contains(e.target) && !anchorOf(pop.kind)?.contains(e.target)) closePopover();
+  if (menuOpen && !menuWrap?.contains(e.target)) setMenuOpen(false);
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && pop) {
+  if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
+  if (pop) {
     const anchor = anchorOf(pop.kind);
     closePopover();
     anchor?.focus();
+    return;
   }
+  if (menuOpen) setMenuOpen(false, { restoreFocus: true });
 });
 
 // ---------------- download ----------------
@@ -299,23 +328,31 @@ async function downloadWithCode(code, turnstileToken = null) {
   await startDownload(r.token);
 }
 
-function onDownload() {
+function onDownload(btn) {
   const d = info.download;
-  if (!d.needs_code) return act(dlBtn, () => startDownload());
+  if (!d.needs_code) {
+    return act(btn, async () => {
+      await startDownload();
+      setMenuOpen(false, { restoreFocus: true });
+    });
+  }
   if (pwd && !triedLinkCode) {
     // The share link carried the code: use it directly, fall back to asking if it no longer works.
     triedLinkCode = true;
-    return act(dlBtn, () =>
-      downloadWithCode(pwd).catch((e) => {
+    return act(btn, async () => {
+      try {
+        await downloadWithCode(pwd);
+        setMenuOpen(false, { restoreFocus: true });
+      } catch (e) {
         if (e.details?.turnstile_site_key) dlCaptchaKey = e.details.turnstile_site_key;
         openPopover('download', e.message);
-      }),
-    );
+      }
+    });
   }
-  togglePopover('download');
+  openPopover('download');
 }
 
-function downloadButton() {
+function downloadMenuItem() {
   const d = info.download;
   const label = t(d.kind === 'zip' ? 'dl.zip' : 'dl.source');
   const detail = d.needs_code
@@ -323,38 +360,92 @@ function downloadButton() {
     : d.kind !== 'zip'
       ? t('dl.sourceTitle', { name: d.name, size: fmtBytes(d.size) })
       : t('dl.zipTitle', { name: d.name, n: d.file_count, size: fmtBytes(d.size) });
-  dlBtn = h(
+  const meta = !d.needs_code && typeof d.size === 'number' ? h('span', { class: 'vmenu-meta' }, fmtBytes(d.size)) : null;
+  const item = h(
     'button',
-    { type: 'button', class: 'sm dl-btn', title: detail, 'aria-label': detail, 'aria-haspopup': d.needs_code ? 'dialog' : null, 'aria-expanded': d.needs_code ? 'false' : null },
+    { type: 'button', class: 'vmenu-item', title: detail, 'aria-haspopup': d.needs_code ? 'dialog' : null },
     icon('download'),
-    h('span', { class: 'hide-sm' }, label),
+    h('span', {}, label),
+    meta,
   );
-  dlBtn.onclick = onDownload;
-  return dlBtn;
+  item.onclick = () => onDownload(item);
+  return item;
 }
-window.addEventListener('blur', () => setTimeout(() => document.activeElement === frame && closePopover(), 0));
+window.addEventListener('blur', () => {
+  setTimeout(() => {
+    if (document.activeElement === frame) {
+      closePopover();
+      setMenuOpen(false);
+    }
+  }, 0);
+});
 window.addEventListener('resize', positionPopover);
 
 // ---------------- bar ----------------
 
 const logo = () => h('a', { class: 'brand', href: '/', title: 'Artifacts', 'aria-label': 'Artifacts' }, brandLogo());
-const signInLink = () => h('a', { class: 'btn sm', href: `/#/login?next=${encodeURIComponent(location.pathname)}` }, t('viewer.signIn'));
+const signInHref = () => `/#/login?next=${encodeURIComponent(location.pathname)}`;
+const menuSep = () => h('div', { class: 'vmenu-sep', 'aria-hidden': 'true' });
 
-const langButton = () =>
-  langToggle('sm hide-sm', () => {
-    if (!info) return renderNotFound();
-    renderBar();
-    if (pop) openPopover(pop.kind);
-    // The iframe is not reloaded: that would throw an unlocked visitor back to the start page. Gateway pages
-    // pick up the new language on their next load.
+function langMenuItem() {
+  return h(
+    'button',
+    {
+      type: 'button',
+      class: 'vmenu-item muted',
+      title: t('lang.switchTitle'),
+      onclick: () => {
+        setLang(lang === 'zh' ? 'en' : 'zh');
+        setMenuOpen(false);
+        // The iframe is not reloaded: that would throw an unlocked visitor back to the start page.
+        // Gateway pages pick up the new language on their next load.
+        if (!info) renderNotFound();
+        else renderBar();
+        menuBtn?.focus();
+      },
+    },
+    icon('public'),
+    h('span', { lang: lang === 'zh' ? 'en' : 'zh-CN' }, t('lang.switchFull')),
+  );
+}
+
+function menuControl(entries) {
+  menuBtn = h(
+    'button',
+    {
+      type: 'button',
+      class: 'vmenu-toggle',
+      'aria-expanded': 'false',
+      'aria-controls': 'vmenu-panel',
+      'aria-label': t('nav.menu'),
+      title: t('nav.menu'),
+      onclick: () => setMenuOpen(!menuOpen),
+    },
+    icon('menu', 'ico ico-menu'),
+    icon('close', 'ico ico-close'),
+  );
+  menuPanel = h('div', { class: 'vmenu', id: 'vmenu-panel' }, entries);
+  menuPanel.addEventListener('click', (e) => {
+    if (e.target.closest('a')) setMenuOpen(false, { restoreFocus: true });
   });
+  menuWrap = h('div', { class: 'vmenu-wrap' }, menuBtn, menuPanel);
+  menuWrap.addEventListener('focusout', (e) => {
+    if (menuOpen && e.relatedTarget && !menuWrap.contains(e.relatedTarget)) setMenuOpen(false);
+  });
+  menuOpen = false;
+  syncOverlay();
+  return menuWrap;
+}
 
 function renderBar() {
   const title = info.title || (info.visibility === 'password' ? t('viewer.protected') : t('common.untitled'));
   document.title = `${title} · Artifacts`;
   const items = [logo(), h('div', { class: 'vtitle', title }, title)];
-  dlBtn = null;
-  if (info.download) items.push(downloadButton());
+  const menuEntries = [];
+  if (info.download) menuEntries.push(downloadMenuItem());
+  menuEntries.push(
+    h('a', { class: 'vmenu-item', href: rawUrl(), target: '_blank', rel: 'noopener' }, icon('external'), h('span', {}, t('viewer.openRaw'))),
+  );
 
   if (info.owner) {
     shareBtn = h(
@@ -366,17 +457,29 @@ function renderBar() {
     );
     shareBtn.onclick = () => togglePopover('share');
     items.push(shareBtn);
-    items.push(h('a', { class: 'btn sm hide-sm', href: rawUrl(), target: '_blank', rel: 'noopener', title: t('viewer.openRaw') }, '↗'));
-    items.push(h('a', { class: 'btn sm hide-sm', href: `/#/a/${info.artifact.id}` }, t('viewer.manage')));
-    const out = h('button', { type: 'button', class: 'sm' }, t('nav.signOut'));
+    menuEntries.push(
+      h('a', { class: 'vmenu-item', href: `/#/a/${info.artifact.id}` }, icon('manage'), h('span', {}, t('viewer.manage'))),
+      menuSep(),
+      langMenuItem(),
+      githubProjectLink({ className: 'vmenu-item muted' }),
+      menuSep(),
+    );
+    const out = h('button', { type: 'button', class: 'vmenu-item muted' }, h('span', {}, t('nav.signOut')));
     out.onclick = () => act(out, signOut);
-    items.push(out);
+    menuEntries.push(out);
   } else {
+    shareBtn = null;
     items.push(h('button', { type: 'button', class: 'sm primary', onclick: () => copy(info.share_url, t('detail.linkCopied')) }, t('viewer.copyLink')));
-    items.push(h('a', { class: 'btn sm hide-sm', href: rawUrl(), target: '_blank', rel: 'noopener', title: t('viewer.openRaw') }, '↗'));
-    items.push(signInLink());
+    menuEntries.push(
+      menuSep(),
+      langMenuItem(),
+      githubProjectLink({ className: 'vmenu-item muted' }),
+      menuSep(),
+      h('a', { class: 'vmenu-item muted', href: signInHref() }, h('span', {}, t('viewer.signIn'))),
+    );
   }
-  items.push(githubProjectLink({ iconOnly: true }), langButton());
+
+  items.push(menuControl(menuEntries));
   $bar.replaceChildren(...items);
 }
 
@@ -385,6 +488,7 @@ function renderBar() {
  * artifact would stay visible in this page for the cookie's lifetime), then end the admin session.
  */
 async function signOut() {
+  setMenuOpen(false);
   closePopover();
   if (frame) {
     await new Promise((resolve) => {
@@ -415,7 +519,14 @@ function renderFrame() {
 
 function renderNotFound() {
   document.title = `${t('viewer.notFoundTitle')} · Artifacts`;
-  $bar.replaceChildren(logo(), h('div', { class: 'vtitle' }, 'Artifacts'), signInLink(), githubProjectLink({ iconOnly: true }), langButton());
+  shareBtn = null;
+  const menu = menuControl([
+    langMenuItem(),
+    githubProjectLink({ className: 'vmenu-item muted' }),
+    menuSep(),
+    h('a', { class: 'vmenu-item muted', href: signInHref() }, h('span', {}, t('viewer.signIn'))),
+  ]);
+  $bar.replaceChildren(logo(), h('div', { class: 'vtitle' }, 'Artifacts'), menu);
   $main.replaceChildren(
     h(
       'div',
