@@ -1,15 +1,15 @@
 import { Hono } from 'hono';
-import type { Env } from '../env';
-import { hashPassword, randomBase62, randomToken, sha256Hex, signPayload, timingSafeEqualStr, verifyPassword } from '../lib/crypto';
+import type { ArtifactRow, Env } from '../env';
+import { hashPassword, randomBase62, randomToken, sha256Hex, signPayload, timingSafeEqualStr, verifyPassword, verifyPayload } from '../lib/crypto';
 import { contentOrigin, isUuid } from '../lib/hosts';
-import { clientIp, HttpError, jsonError, now, readJsonObject, safeRelativePath } from '../lib/http';
+import { clearHostCookie, clientIp, hostCookie, HttpError, jsonError, now, parseCookies, readJsonObject, safeRelativePath } from '../lib/http';
 import { peekAttempts } from '../lib/ratelimit';
-import { guardedAttempt, loginBucket } from '../lib/access';
+import { captchaRequired, guardedAttempt, loginBucket, verifyAccessCode } from '../lib/access';
 import { analyticsEnabled, recordReferral } from '../lib/analytics';
 import { CAPTCHA_AFTER_FAILS, turnstileEnabled } from '../lib/turnstile';
 import { getInternal, getSettings, setInternal, updateSettings } from '../lib/settings';
 import { artifactView, getArtifact, getArtifactByPublicId, viewerUrl } from '../lib/store';
-import type { HandoffTicket } from '../content/gateway';
+import type { HandoffTicket, UnlockProof } from '../content/gateway';
 import { api } from './api';
 import { downloadInfo, registerDownloadRoutes } from './download';
 import {
@@ -102,17 +102,50 @@ app.get('/s/:pid', async (c) => {
   return res;
 });
 
+const UNLOCK_META_COOKIE = 'as_unlock_meta';
+const UNLOCK_META_TTL = 7 * 24 * 3600;
+const UNLOCK_META_MAX = 20;
+interface UnlockMetaEntry { id: string; v: number; exp: number }
+interface UnlockMetaClaim { k: 'unlock_meta'; items: UnlockMetaEntry[] }
+
+async function readUnlockMeta(env: Env, req: Request): Promise<UnlockMetaEntry[]> {
+  const raw = parseCookies(req.headers.get('cookie'))[`__Host-${UNLOCK_META_COOKIE}`];
+  const claim = await verifyPayload<UnlockMetaClaim>(env.SECRET_KEY, raw);
+  if (!claim || claim.k !== 'unlock_meta' || !Array.isArray(claim.items)) return [];
+  const t = now();
+  return claim.items.filter(
+    (e): e is UnlockMetaEntry =>
+      !!e && typeof e.id === 'string' && typeof e.v === 'number' && typeof e.exp === 'number' && e.exp > t,
+  );
+}
+
+async function hasUnlockMeta(env: Env, req: Request, a: ArtifactRow): Promise<boolean> {
+  const items = await readUnlockMeta(env, req);
+  return items.some((e) => e.id === a.public_id && e.v === a.password_ver);
+}
+
+async function unlockMetaCookie(env: Env, req: Request, a: ArtifactRow): Promise<string> {
+  const prev = await readUnlockMeta(env, req);
+  const next = [
+    ...prev.filter((e) => e.id !== a.public_id),
+    { id: a.public_id, v: a.password_ver, exp: now() + UNLOCK_META_TTL },
+  ].slice(-UNLOCK_META_MAX);
+  const token = await signPayload(env.SECRET_KEY, { k: 'unlock_meta', items: next } satisfies UnlockMetaClaim);
+  return hostCookie(UNLOCK_META_COOKIE, token, UNLOCK_META_TTL);
+}
+
 // Metadata for the viewer bar. Non-owners learn only what the iframe would show them anyway.
 app.get('/api/public/artifacts/:pid', async (c) => {
   const v = await viewable(c, c.req.param('pid'));
   if (!v) throw new HttpError(404, 'not_found', 'Not found');
   const { a, owner } = v;
   const ref = new URL(c.req.url);
+  // An access-code artifact's title is withheld until the visitor verifies the code.
+  const titleVisible = owner || a.visibility !== 'password' || (await hasUnlockMeta(c.env, c.req.raw, a));
   const base = {
     download: await downloadInfo(c.env, c.req.raw, a, owner),
     public_id: a.public_id,
-    // An access-code artifact's title is withheld until the visitor can see the content.
-    title: a.visibility === 'password' && !owner ? null : a.title,
+    title: titleVisible ? a.title : null,
     visibility: a.visibility,
     share_url: viewerUrl(c.env, a.public_id, ref),
     content_url: `${contentOrigin(c.env, a.public_id, ref)}/`,
@@ -125,6 +158,41 @@ app.get('/api/public/artifacts/:pid', async (c) => {
     // The iframe signs the owner in on the subdomain, so private/code-protected content shows directly.
     frame_url: await ownerAuthUrl(c.env, ref, a.public_id, sessionOf(c)!.sessionId),
   });
+});
+
+// Verifies an access code (from ?pwd=) or a signed iframe unlock proof so the viewer bar can show the real title (and keep it on reload).
+app.post('/api/public/artifacts/:pid/unlock', async (c) => {
+  const v = await viewable(c, c.req.param('pid'));
+  if (!v) throw new HttpError(404, 'not_found', 'Not found');
+  const { a, owner } = v;
+  if (owner || a.visibility !== 'password') return c.json({ title: a.title });
+  // Require application/json so cross-site text/plain form POSTs cannot overwrite a visitor's cookie.
+  const mediaType = (c.req.header('content-type') ?? '').split(';', 1)[0].trim().toLowerCase();
+  if (mediaType !== 'application/json') throw new HttpError(415, 'unsupported_media_type', 'Content-Type must be application/json');
+  const { code, proof, turnstile_token } = await readJsonObject<{ code?: unknown; proof?: unknown; turnstile_token?: unknown }>(c.req.raw, { optional: true, maxBytes: 16 * 1024 });
+  if (typeof proof === 'string' && proof) {
+    const p = await verifyPayload<UnlockProof>(c.env.SECRET_KEY, proof);
+    if (!p || p.k !== 'unlock_proof' || p.id !== a.public_id || p.v !== a.password_ver || p.exp <= now()) {
+      throw new HttpError(403, 'invalid_proof', 'Unlock proof is invalid or expired');
+    }
+    c.header('set-cookie', await unlockMetaCookie(c.env, c.req.raw, a));
+    return c.json({ title: a.title });
+  }
+  const check = await verifyAccessCode(
+    c.env,
+    c.req.raw,
+    a,
+    typeof code === 'string' ? code : '',
+    typeof turnstile_token === 'string' ? turnstile_token : null,
+  );
+  if (!check.ok) {
+    const captcha = (await captchaRequired(c.env, c.req.raw, a)) ? { turnstile_site_key: c.env.TURNSTILE_SITE_KEY } : {};
+    if (check.reason === 'locked') throw new HttpError(429, 'rate_limited', 'Too many attempts, try again later', { retry_after: check.retryAfter });
+    if (check.reason === 'turnstile') throw new HttpError(403, 'turnstile_required', 'Complete the verification first', captcha);
+    throw new HttpError(403, 'incorrect_code', 'Incorrect access code', { remaining: check.remaining, ...captcha });
+  }
+  c.header('set-cookie', await unlockMetaCookie(c.env, c.req.raw, a));
+  return c.json({ title: a.title });
 });
 
 registerDownloadRoutes(app, viewable);
@@ -184,12 +252,14 @@ app.post('/api/auth/login', async (c) => {
 app.post('/api/auth/logout', async (c) => {
   const s = sessionOf(c);
   if (s) c.header('set-cookie', await destroySession(c.env, s.sessionId));
+  c.header('set-cookie', clearHostCookie(UNLOCK_META_COOKIE), { append: true });
   return c.json({ ok: true });
 });
 
 app.post('/api/auth/logout-all', requireSession, async (c) => {
   await c.env.DB.prepare('DELETE FROM sessions').run();
   c.header('set-cookie', await destroySession(c.env, sessionOf(c)!.sessionId));
+  c.header('set-cookie', clearHostCookie(UNLOCK_META_COOKIE), { append: true });
   return c.json({ ok: true });
 });
 

@@ -702,6 +702,309 @@ describe('share viewer (main domain)', () => {
     expect(shown.headers.get('x-robots-tag')).toBe('all');
     await shown.arrayBuffer();
   });
+
+  it('reveals a password artifact title after unlocking and keeps it across reloads until reset', async () => {
+    const a = await createHtml('<p>secret</p>', '?visibility=password&title=Quarterly%20Plan');
+    const b = await createHtml('<p>secret2</p>', '?visibility=password&title=Design%20Doc');
+    const priv = await createHtml('<p>priv</p>', '?visibility=private&title=Hidden');
+    const pub = await createHtml('<p>pub</p>', '?visibility=public&title=Public%20Doc');
+    const ip = { 'cf-connecting-ip': '203.0.113.41' };
+
+    // Before unlock: title is withheld, tampered cookie is ignored.
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}`), 200)).title).toBeNull();
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}`, { headers: { cookie: '__Host-as_unlock_meta=tampered.sig' } }), 200)).title).toBeNull();
+
+    // Private artifact looks nonexistent; public returns title without setting an unlock cookie.
+    expect((await fetchRaw(`${MAIN}/api/public/artifacts/${priv.public_id}/unlock`, { method: 'POST', headers: { 'content-type': 'application/json', ...ip }, body: JSON.stringify({ code: 'AAAAAA' }) })).status).toBe(404);
+    const pubRes = await fetchRaw(`${MAIN}/api/public/artifacts/${pub.public_id}/unlock`, { method: 'POST', headers: { 'content-type': 'application/json', ...ip }, body: JSON.stringify({}) });
+    expect(await json(pubRes, 200)).toEqual({ title: 'Public Doc' });
+    expect(pubRes.headers.getSetCookie()).toEqual([]);
+
+    // Non-JSON Content-Type (e.g., cross-site text/plain form POST) is rejected before touching cookies or rate limits.
+    expect((await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain', ...ip },
+      body: JSON.stringify({ code: a.password }),
+    })).status).toBe(415);
+
+    // A signed content-host unlock token cannot be confused for a main-domain unlock_meta cookie.
+    const subUnlock = await fetchRaw(`${a.content_url}?pwd=${a.password}`, { headers: ip });
+    const subUnlockVal = cookieFrom(subUnlock, 'as_unlock').split('=')[1];
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}`, { headers: { cookie: `__Host-as_unlock_meta=${subUnlockVal}` } }), 200)).title).toBeNull();
+
+    // Owner session gets CSRF-checked on cross-site Origin and gets title without setting visitor cookie on same-origin.
+    expect((await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: session, origin: 'https://evil.example' },
+      body: JSON.stringify({}),
+    })).status).toBe(403);
+    const ownerRes = await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: session, ...ORIGIN },
+      body: JSON.stringify({}),
+    });
+    expect(await json(ownerRes, 200)).toEqual({ title: 'Quarterly Plan' });
+    expect(ownerRes.headers.getSetCookie().some((c) => c.startsWith('__Host-as_unlock_meta='))).toBe(false);
+
+    // Valid code (case-insensitive + trimmed) returns the title and sets an HttpOnly signed cookie.
+    const okRes = await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip },
+      body: JSON.stringify({ code: ` ${a.password!.toLowerCase()} ` }),
+    });
+    expect(await json(okRes, 200)).toEqual({ title: 'Quarterly Plan' });
+    const rawSetCookie = okRes.headers.getSetCookie().find((c) => c.startsWith('__Host-as_unlock_meta='));
+    expect(rawSetCookie).toMatch(/HttpOnly/);
+    expect(rawSetCookie).toMatch(/Secure/);
+    expect(rawSetCookie).toMatch(/SameSite=Lax/);
+    const metaCookieA = cookieFrom(okRes, 'as_unlock_meta');
+
+    // Subsequent GET (page reload after ?pwd= is stripped) keeps returning the real title.
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}`, { headers: { cookie: metaCookieA } }), 200)).title).toBe('Quarterly Plan');
+    // Unrelated password artifact stays hidden.
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${b.public_id}`, { headers: { cookie: metaCookieA } }), 200)).title).toBeNull();
+
+    // Empty title ("") is returned as "" (not null) once unlocked so the viewer shows "Untitled" instead of "Protected".
+    const untitled = await createHtml('<p>u</p>', '?visibility=password&title=');
+    const untitledRes = await fetchRaw(`${MAIN}/api/public/artifacts/${untitled.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip },
+      body: JSON.stringify({ code: untitled.password }),
+    });
+    expect(await json(untitledRes, 200)).toEqual({ title: '' });
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${untitled.public_id}`, { headers: { cookie: cookieFrom(untitledRes, 'as_unlock_meta') } }), 200)).title).toBe('');
+
+    // Unlocking a second artifact preserves the first inside the same cookie.
+    const okResB = await fetchRaw(`${MAIN}/api/public/artifacts/${b.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: metaCookieA, ...ip },
+      body: JSON.stringify({ code: b.password }),
+    });
+    expect(await json(okResB, 200)).toEqual({ title: 'Design Doc' });
+    const metaCookieAB = cookieFrom(okResB, 'as_unlock_meta');
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}`, { headers: { cookie: metaCookieAB } }), 200)).title).toBe('Quarterly Plan');
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${b.public_id}`, { headers: { cookie: metaCookieAB } }), 200)).title).toBe('Design Doc');
+
+    // Resetting the access code bumps password_ver and immediately invalidates the cookie entry for `a` only.
+    await json(await api(`/api/v1/artifacts/${a.id}/password/reset`, { method: 'POST' }), 200);
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}`, { headers: { cookie: metaCookieAB } }), 200)).title).toBeNull();
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${b.public_id}`, { headers: { cookie: metaCookieAB } }), 200)).title).toBe('Design Doc');
+
+    // Admin logout clears the unlock-meta cookie alongside the session cookie.
+    const logoutRes = await fetchRaw(`${MAIN}/api/auth/logout`, { method: 'POST', headers: { cookie: metaCookieAB } });
+    expect(logoutRes.status).toBe(200);
+    expect(logoutRes.headers.getSetCookie().some((c) => c.startsWith('__Host-as_unlock_meta=;') && c.includes('Max-Age=0'))).toBe(true);
+  });
+
+  it('shares the access-code rate limit on /unlock and never leaks title on failure', async () => {
+    const a = await createHtml('<p>secret</p>', '?visibility=password&title=Top%20Secret');
+    const ip = { 'cf-connecting-ip': '203.0.113.42' };
+
+    const bad1 = await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip },
+      body: JSON.stringify({ code: 'WRONG1' }),
+    });
+    const body1 = await json(bad1, 403);
+    expect(body1.error.code).toBe('incorrect_code');
+    expect(body1.error.remaining).toBe(4);
+    expect(JSON.stringify(body1)).not.toContain('Top Secret');
+    expect(bad1.headers.getSetCookie()).toEqual([]);
+
+    // Subsequent failure on the content gateway shares the same counter (remaining drops from 4 to 3).
+    const gwBad = await fetchRaw(`${a.content_url}?pwd=WRONG2&__lang=en`, { headers: ip });
+    expect(gwBad.status).toBe(401);
+    expect(await gwBad.text()).toContain('3 attempt(s) left');
+
+    // Next /unlock failure sees remaining = 2, then 1, then 429 rate_limited.
+    const bad3 = await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip },
+      body: JSON.stringify({ code: 'BAD003' }),
+    }), 403);
+    expect(bad3.error.remaining).toBe(2);
+    const bad4 = await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip },
+      body: JSON.stringify({ code: 'BAD004' }),
+    }), 403);
+    expect(bad4.error.remaining).toBe(1);
+    const locked = await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip },
+      body: JSON.stringify({ code: 'BAD005' }),
+    });
+    const lockedBody = await json(locked, 429);
+    expect(lockedBody.error.code).toBe('rate_limited');
+    expect(Number(locked.headers.get('retry-after'))).toBeGreaterThan(0);
+  });
+
+  it('notifies the parent viewer with a signed proof after manual iframe unlock', async () => {
+    const a = await createHtml('<p>manual</p>', '?visibility=password&title=Manual%20Unlock');
+    const b = await createHtml('<p>other</p>', '?visibility=password&title=Other%20Secret');
+    const pub = await createHtml('<p>pub</p>', '?visibility=public&title=Open%20Page');
+    const ip = { 'cf-connecting-ip': '203.0.113.43' };
+
+    // Static bridge script is served on the content host (GET + HEAD; 405 on POST; CORP: same-origin).
+    const js = await fetchRaw(`${a.content_url}__share/unlocked.js`);
+    expect(js.status).toBe(200);
+    expect(js.headers.get('content-type')).toContain('text/javascript');
+    expect(js.headers.get('cross-origin-resource-policy')).toBe('same-origin');
+    expect(await js.text()).toContain('as:unlocked');
+    const jsHead = await fetchRaw(`${a.content_url}__share/unlocked.js`, { method: 'HEAD' });
+    expect(jsHead.status).toBe(200);
+    expect(jsHead.headers.get('cross-origin-resource-policy')).toBe('same-origin');
+    expect(await jsHead.text()).toBe('');
+    expect((await fetchRaw(`${a.content_url}__share/unlocked.js`, { method: 'POST' })).status).toBe(405);
+
+    // Manual form unlock on the content subdomain redirects to __chk=1.
+    const form = new URLSearchParams({ code: a.password!, next: '/docs/page.html?x=1', __lang: 'en' });
+    const submit = await fetchRaw(`${a.content_url}__share/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', ...ip },
+      body: form.toString(),
+    });
+    expect(submit.status).toBe(303);
+    const unlockCookie = cookieFrom(submit, 'as_unlock');
+    const chkUrl = new URL(submit.headers.get('location')!, a.content_url).toString();
+
+    // Non-iframe / HEAD / omitted Sec-Fetch-Dest / public / owner requests still get a plain 302 redirect.
+    const nonIframe: RequestInit[] = [
+      { headers: { cookie: unlockCookie, 'sec-fetch-dest': 'document' } },
+      { headers: { cookie: unlockCookie } },
+      { method: 'HEAD', headers: { cookie: unlockCookie, 'sec-fetch-dest': 'iframe' } },
+    ];
+    for (const reqInit of nonIframe) {
+      const hop = await fetchRaw(chkUrl, reqInit);
+      expect(hop.status).toBe(302);
+      expect(hop.headers.get('location')).toBe('/docs/page.html?x=1');
+    }
+    const pubChk = await fetchRaw(`${pub.content_url}?__chk=1&__lang=en`, { headers: { 'sec-fetch-dest': 'iframe' } });
+    expect(pubChk.status).toBe(302);
+    expect(pubChk.headers.get('location')).toBe('/');
+    const ownerInfo = await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}`, { headers: { cookie: session } }), 200);
+    const ownerAuth = await fetchRaw(ownerInfo.frame_url);
+    const ownerCookie = cookieFrom(ownerAuth, 'as_owner');
+    const ownerChk = await fetchRaw(new URL(ownerAuth.headers.get('location')!, a.content_url).toString(), {
+      headers: { cookie: ownerCookie, 'sec-fetch-dest': 'iframe' },
+    });
+    expect(ownerChk.status).toBe(302);
+    expect(ownerChk.headers.get('location')).toBe('/');
+
+    // Blocked 3P cookie in iframe still shows cookiesBlockedPage (never emits a proof).
+    const blocked = await fetchRaw(chkUrl, { headers: { 'sec-fetch-dest': 'iframe' } });
+    expect(blocked.status).toBe(200);
+    const blockedHtml = await blocked.text();
+    expect(blockedHtml).not.toContain('data-proof=');
+
+    // Accepted cookie inside iframe returns the strict-CSP bridge page carrying a signed proof.
+    const iframeHop = await fetchRaw(chkUrl, { headers: { cookie: unlockCookie, 'sec-fetch-dest': 'iframe' } });
+    expect(iframeHop.status).toBe(200);
+    expect(iframeHop.headers.get('cache-control')).toBe('private, no-store');
+    expect(iframeHop.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(iframeHop.headers.get('x-robots-tag')).toBe('noindex, nofollow');
+    expect(iframeHop.headers.get('content-security-policy')).toBe(
+      `default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'self' ${MAIN}; base-uri 'none'`,
+    );
+    const html = await iframeHop.text();
+    expect(html).toContain(`data-origin="${MAIN}"`);
+    expect(html).toContain('data-next="/docs/page.html?x=1"');
+    const proof = html.match(/data-proof="([^"]+)"/)?.[1];
+    expect(proof).toBeDefined();
+
+    // ?pwd= iframe hop also strips pwd from data-next.
+    const pwdJump = await fetchRaw(`${a.content_url}?pwd=${a.password}&__lang=en`, { headers: ip });
+    expect(pwdJump.status).toBe(302);
+    const pwdChk = await fetchRaw(new URL(pwdJump.headers.get('location')!, a.content_url).toString(), {
+      headers: { cookie: cookieFrom(pwdJump, 'as_unlock'), 'sec-fetch-dest': 'iframe' },
+    });
+    expect(pwdChk.status).toBe(200);
+    const pwdHtml = await pwdChk.text();
+    expect(pwdHtml).toContain('data-next="/"');
+    expect(pwdHtml).not.toContain(a.password!);
+
+    // Token confusion: content as_unlock token is rejected as proof, and proof is rejected as as_unlock cookie.
+    const rawUnlockVal = unlockCookie.split('=')[1];
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip },
+      body: JSON.stringify({ proof: rawUnlockVal }),
+    }), 403)).error.code).toBe('invalid_proof');
+    const spoofedSub = await fetchRaw(a.content_url, { headers: { cookie: `__Host-as_unlock=${proof}` } });
+    expect(spoofedSub.status).toBe(401);
+    await spoofedSub.arrayBuffer();
+
+    // Proof for artifact `a` cannot be used on artifact `b`, and tampered proof is rejected.
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${b.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip },
+      body: JSON.stringify({ proof }),
+    }), 403)).error.code).toBe('invalid_proof');
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip },
+      body: JSON.stringify({ proof: 'tampered.sig' }),
+    }), 403)).error.code).toBe('invalid_proof');
+
+    // Trading the valid proof on the main domain reveals the real title and persists it via __Host-as_unlock_meta.
+    const traded = await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip },
+      body: JSON.stringify({ proof }),
+    });
+    expect(await json(traded, 200)).toEqual({ title: 'Manual Unlock' });
+    const metaCookie = cookieFrom(traded, 'as_unlock_meta');
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}`, { headers: { cookie: metaCookie } }), 200)).title).toBe('Manual Unlock');
+
+    // Self-heal via __proof=1: existing content-host unlock cookie emits a proof in iframe, strips __proof,
+    // while un-unlocked visitors still get the normal 401 unlock form (not cookiesBlockedPage) and public redirects.
+    const heal = await fetchRaw(`${a.content_url}?__lang=en&__proof=1`, { headers: { cookie: unlockCookie, 'sec-fetch-dest': 'iframe' } });
+    expect(heal.status).toBe(200);
+    const healHtml = await heal.text();
+    expect(healHtml).toContain('data-next="/"');
+    const healProof = healHtml.match(/data-proof="([^"]+)"/)?.[1];
+    expect(healProof).toBeDefined();
+    expect(await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip },
+      body: JSON.stringify({ proof: healProof }),
+    }), 200)).toEqual({ title: 'Manual Unlock' });
+
+    const healLocked = await fetchRaw(`${a.content_url}?__lang=en&__proof=1`, { headers: { 'sec-fetch-dest': 'iframe' } });
+    expect(healLocked.status).toBe(401);
+    const healLockedHtml = await healLocked.text();
+    expect(healLockedHtml).toContain('/__share/unlock');
+    expect(healLockedHtml).toContain('name="next" value="/"');
+    expect(healLockedHtml).not.toContain('__proof');
+    expect(healLockedHtml).not.toContain('data-proof=');
+
+    // __proof=1 for unlocked non-iframe/HEAD, owner, public, and private (no existence oracle).
+    for (const reqInit of nonIframe) {
+      const strip = await fetchRaw(`${a.content_url}?__proof=1`, reqInit);
+      expect(strip.status).toBe(302);
+      expect(strip.headers.get('location')).toBe('/');
+    }
+    const healOwner = await fetchRaw(`${a.content_url}?__proof=1`, { headers: { cookie: ownerCookie, 'sec-fetch-dest': 'iframe' } });
+    expect(healOwner.status).toBe(302);
+    expect(healOwner.headers.get('location')).toBe('/');
+
+    const healPub = await fetchRaw(`${pub.content_url}?__proof=1`, { headers: { 'sec-fetch-dest': 'iframe' } });
+    expect(healPub.status).toBe(302);
+    expect(healPub.headers.get('location')).toBe('/');
+
+    const priv = await createHtml('<p>priv</p>', '?visibility=private&title=Hidden');
+    const healPriv = await fetchRaw(`${priv.content_url}?__proof=1`, { headers: { 'sec-fetch-dest': 'iframe' } });
+    expect(healPriv.status).toBe(404);
+    expect(await healPriv.text()).not.toContain('data-proof=');
+
+    // Resetting the access code immediately invalidates previously issued proofs too.
+    await json(await api(`/api/v1/artifacts/${a.id}/password/reset`, { method: 'POST' }), 200);
+    expect((await json(await fetchRaw(`${MAIN}/api/public/artifacts/${a.public_id}/unlock`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip },
+      body: JSON.stringify({ proof }),
+    }), 403)).error.code).toBe('invalid_proof');
+  });
 });
 
 describe('viewer language passed to the iframe', () => {
