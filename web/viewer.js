@@ -317,12 +317,14 @@ document.addEventListener('keydown', (e) => {
  * Starts the browser download (an attachment response; the page stays put). The same URL with `check=1`
  * is asked first, so a refusal (token expired, downloads just turned off) surfaces as an error here.
  */
-async function startDownload(token) {
+async function startDownload(token, { skipCheck = false } = {}) {
   const u = new URL(`/s/${encodeURIComponent(publicId)}/download`, location.origin);
   if (token) u.searchParams.set('token', token);
-  const check = new URL(u);
-  check.searchParams.set('check', '1');
-  await api('GET', check.pathname + check.search);
+  if (!skipCheck) {
+    const check = new URL(u);
+    check.searchParams.set('check', '1');
+    await api('GET', check.pathname + check.search);
+  }
   const a = h('a', { href: u.toString(), download: '' });
   document.body.append(a);
   a.click();
@@ -332,7 +334,7 @@ async function startDownload(token) {
 
 async function downloadWithCode(code, turnstileToken = null) {
   const r = await api('POST', `/api/public/artifacts/${encodeURIComponent(publicId)}/download-token`, { code, turnstile_token: turnstileToken ?? undefined });
-  await startDownload(r.token);
+  await startDownload(r.token, { skipCheck: true });
 }
 
 function onDownload(btn) {
@@ -578,8 +580,20 @@ function renderNotFound() {
   );
 }
 
-async function loadInfo() {
-  info = await api('GET', `/api/public/artifacts/${encodeURIComponent(publicId)}`);
+function consumeInitInfo() {
+  const el = document.getElementById('viewer-init');
+  if (!el) return null;
+  el.remove();
+  try {
+    const data = JSON.parse(el.textContent || '');
+    return data && data.public_id === publicId ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+async function loadInfo({ useInit = false } = {}) {
+  info = (useInit && consumeInitInfo()) || (await api('GET', `/api/public/artifacts/${encodeURIComponent(publicId)}`));
   dlCaptchaKey = info.download?.turnstile_site_key ?? dlCaptchaKey;
 }
 
@@ -609,7 +623,7 @@ async function unlockWithLinkCode() {
 async function main() {
   document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
   try {
-    await loadInfo();
+    await loadInfo({ useInit: true });
     await unlockWithLinkCode();
   } catch (e) {
     if (e.status === 404) return renderNotFound();

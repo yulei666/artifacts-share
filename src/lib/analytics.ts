@@ -68,17 +68,32 @@ const RANGE_CONFIG: Record<AnalyticsRange, { stepSec: number; buckets: number; b
 
 const CACHE_TTL_MS = 60_000;
 const CACHE_MAX = 200;
+const VIEWS_CACHE_MAX = 500;
+const MAX_WAE_CONCURRENCY = 6;
 const queryCache = new Map<string, { exp: number; data: Exclude<AnalyticsResponse, { enabled: false }> }>();
 const inFlight = new Map<string, Promise<Exclude<AnalyticsResponse, { enabled: false }>>>();
-const viewsCache = new Map<string, { exp: number; data: Exclude<AnalyticsViewsResponse, { enabled: false }> }>();
-const viewsInFlight = new Map<string, Promise<Exclude<AnalyticsViewsResponse, { enabled: false }>>>();
+const viewsCache = new Map<string, { exp: number; views: number }>();
+const viewsInFlight = new Map<string, Promise<{ views: number; missingDataset: boolean }>>();
+const views90dCache = new Map<string, { exp: number; views: number }>();
+const views90dInFlight = new Map<string, Promise<{ views: number; missingDataset: boolean }>>();
 const enc = new TextEncoder();
+
+function setBoundedCache<T>(cache: Map<string, T>, key: string, value: T, max: number): void {
+  if (cache.has(key)) cache.delete(key);
+  else if (cache.size >= max) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, value);
+}
 
 export function clearAnalyticsCache(): void {
   queryCache.clear();
   inFlight.clear();
   viewsCache.clear();
   viewsInFlight.clear();
+  views90dCache.clear();
+  views90dInFlight.clear();
 }
 
 export function analyticsEnabled(env: Env): boolean {
@@ -116,8 +131,11 @@ export function parseAnalyticsParams(url: URL): { range: AnalyticsRange; tz: num
   return { range: rawRange as AnalyticsRange, tz, includeBots: rawBots === '1' };
 }
 
+const ASCII_RE = /^[\x00-\x7f]*$/;
+
 function truncateUtf8(str: string, maxBytes: number): string {
-  if (!str) return '';
+  if (!str || maxBytes <= 0) return '';
+  if (str.length <= maxBytes && ASCII_RE.test(str)) return str;
   let out = '';
   let used = 0;
   for (const ch of str) {
@@ -385,6 +403,69 @@ function buildSeries(
 
 const VALID_DEVICES = new Set<AnalyticsDevice>(['desktop', 'mobile', 'tablet', 'bot', 'cli']);
 
+async function runWithConcurrency(tasks: Array<() => Promise<void>>, limit: number): Promise<void> {
+  let next = 0;
+  let failed = false;
+  const workerCount = Math.min(limit, tasks.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (!failed && next < tasks.length) {
+        const idx = next++;
+        try {
+          await tasks[idx]();
+        } catch (err) {
+          failed = true;
+          throw err;
+        }
+      }
+    }),
+  );
+}
+
+async function queryViews90d(
+  env: Env,
+  accountId: string,
+  dataset: string,
+  opts: { artifact?: ArtifactRow; includeBots: boolean },
+  nowMs: number,
+): Promise<{ views: number; missingDataset: boolean }> {
+  if (opts.artifact && !opts.includeBots) {
+    const res = await queryAnalyticsViews(env, [opts.artifact.id]);
+    if (!res.enabled) return { views: 0, missingDataset: false };
+    return {
+      views: res.views[opts.artifact.id] ?? 0,
+      missingDataset: Boolean(res.dataset_missing),
+    };
+  }
+
+  const cacheKey = `${accountId}:${dataset}:${opts.artifact?.id ?? 'site'}:${opts.includeBots ? 1 : 0}`;
+  const cached = views90dCache.get(cacheKey);
+  if (cached && cached.exp > nowMs) return { views: cached.views, missingDataset: false };
+  if (cached) views90dCache.delete(cacheKey);
+
+  const pending = views90dInFlight.get(cacheKey);
+  if (pending) return pending;
+
+  const task = (async (): Promise<{ views: number; missingDataset: boolean }> => {
+    const scopeFilter = opts.artifact ? `index1 = '${opts.artifact.id}' AND ` : '';
+    const botFilter = opts.includeBots ? '' : " AND blob5 NOT IN ('bot', 'cli')";
+    const since90d = Math.floor(nowMs / 1000) - VIEWS_WINDOW_DAYS * 86400;
+    // Always query rolling 90d so `views_90d` stays timezone-independent and matches `/api/v1/analytics/views`.
+    const sql = `SELECT SUM(_sample_interval) AS total FROM ${dataset} WHERE ${scopeFilter}blob1 = 'view' AND timestamp >= toDateTime(${since90d})${botFilter} FORMAT JSON`;
+    const res = await runSql<{ total: number | string }>(env, sql, dataset);
+    const views = toInt(res.data[0]?.total);
+    if (!res.missingDataset) {
+      setBoundedCache(views90dCache, cacheKey, { exp: Date.now() + CACHE_TTL_MS, views }, CACHE_MAX);
+    }
+    return { views, missingDataset: res.missingDataset };
+  })().finally(() => {
+    if (views90dInFlight.get(cacheKey) === task) views90dInFlight.delete(cacheKey);
+  });
+
+  views90dInFlight.set(cacheKey, task);
+  return task;
+}
+
 export async function queryAnalytics(
   env: Env,
   opts: { artifact?: ArtifactRow; range: AnalyticsRange; tz: number; includeBots: boolean },
@@ -430,21 +511,55 @@ export async function queryAnalytics(
       : needTopArtifacts
         ? `SELECT index1 AS id, SUM(_sample_interval) AS views, COUNT(DISTINCT blob2) AS visitors FROM ${dataset} WHERE blob1 = 'view' AND index1 != '' AND ${timeFilter}${botFilter} GROUP BY id ORDER BY views DESC LIMIT 10 FORMAT JSON`
         : null;
-    const since90d = nowSec - VIEWS_WINDOW_DAYS * 86400;
-    // Always query rolling 90d so `views_90d` stays timezone-independent and matches `/api/v1/analytics/views`.
-    const views90dSql = `SELECT SUM(_sample_interval) AS total FROM ${dataset} WHERE ${scopeFilter}blob1 = 'view' AND timestamp >= toDateTime(${since90d})${botFilter} FORMAT JSON`;
 
-    const [totalsRes, seriesRes, countriesRes, referrersRes, devicesRes, extraRes, views90dRes] = await Promise.all([
-      runSql<{ event: string; total: number | string; uv: number | string; no_ref?: number | string }>(env, totalsSql, dataset),
-      runSql<{ bucket_ts: number | string; event: string; total: number | string; uv: number | string }>(env, seriesSql, dataset),
-      runSql<{ code: string; views: number | string }>(env, countriesSql, dataset),
-      runSql<{ host: string; hits: number | string }>(env, referrersSql, dataset),
-      runSql<{ device: string; views: number | string }>(env, devicesSql, dataset),
-      extraSql ? runSql<Record<string, unknown>>(env, extraSql, dataset) : Promise.resolve(null),
-      runSql<{ total: number | string }>(env, views90dSql, dataset),
-    ]);
+    const state: {
+      totalsRes?: SqlApiResult<{ event: string; total: number | string; uv: number | string; no_ref?: number | string }>;
+      seriesRes?: SqlApiResult<{ bucket_ts: number | string; event: string; total: number | string; uv: number | string }>;
+      countriesRes?: SqlApiResult<{ code: string; views: number | string }>;
+      referrersRes?: SqlApiResult<{ host: string; hits: number | string }>;
+      devicesRes?: SqlApiResult<{ device: string; views: number | string }>;
+      extraRes: SqlApiResult<Record<string, unknown>> | null;
+      views90dRes?: { views: number; missingDataset: boolean };
+    } = { extraRes: null };
 
-    const datasetMissing = [totalsRes, seriesRes, countriesRes, referrersRes, devicesRes, extraRes, views90dRes].some((r) => r?.missingDataset);
+    const sqlTasks: Array<() => Promise<void>> = [
+      async () => {
+        state.views90dRes = await queryViews90d(env, accountId, dataset, opts, nowMs);
+      },
+      async () => {
+        state.totalsRes = await runSql(env, totalsSql, dataset);
+      },
+      async () => {
+        state.seriesRes = await runSql(env, seriesSql, dataset);
+      },
+      async () => {
+        state.countriesRes = await runSql(env, countriesSql, dataset);
+      },
+      async () => {
+        state.referrersRes = await runSql(env, referrersSql, dataset);
+      },
+      async () => {
+        state.devicesRes = await runSql(env, devicesSql, dataset);
+      },
+    ];
+    if (extraSql) {
+      sqlTasks.push(async () => {
+        state.extraRes = await runSql<Record<string, unknown>>(env, extraSql, dataset);
+      });
+    }
+    await runWithConcurrency(sqlTasks, MAX_WAE_CONCURRENCY);
+
+    const totalsRes = state.totalsRes!;
+    const seriesRes = state.seriesRes!;
+    const countriesRes = state.countriesRes!;
+    const referrersRes = state.referrersRes!;
+    const devicesRes = state.devicesRes!;
+    const extraRes = state.extraRes;
+    const views90dRes = state.views90dRes!;
+
+    const datasetMissing =
+      views90dRes.missingDataset ||
+      [totalsRes, seriesRes, countriesRes, referrersRes, devicesRes, extraRes].some((r) => r?.missingDataset);
 
     let views = 0;
     let visitors = 0;
@@ -462,7 +577,7 @@ export async function queryAnalytics(
         noRefReferrals = toInt(r.no_ref);
       }
     }
-    const views90d = toInt(views90dRes.data[0]?.total);
+    const views90d = views90dRes.views;
 
     const series = buildSeries(seriesRes.data, cfg.stepSec, cfg.buckets, currentBucket);
 
@@ -536,11 +651,7 @@ export async function queryAnalytics(
     }
 
     if (!datasetMissing) {
-      if (queryCache.size >= CACHE_MAX) {
-        const oldest = queryCache.keys().next().value;
-        if (oldest !== undefined) queryCache.delete(oldest);
-      }
-      queryCache.set(cacheKey, { exp: Date.now() + CACHE_TTL_MS, data: result });
+      setBoundedCache(queryCache, cacheKey, { exp: Date.now() + CACHE_TTL_MS, data: result }, CACHE_MAX);
     }
     return result;
   })().finally(() => {
@@ -581,45 +692,78 @@ export async function queryAnalyticsViews(env: Env, ids: string[]): Promise<Anal
 
   const accountId = env.CF_ACCOUNT_ID!.trim();
   const dataset = resolveDataset(env);
-  const sortedIds = [...cleanIds].sort();
-  const cacheKey = `${accountId}:${dataset}:${sortedIds.join(',')}`;
   const nowMs = Date.now();
-  const cached = viewsCache.get(cacheKey);
-  if (cached && cached.exp > nowMs) return cached.data;
-  if (cached) viewsCache.delete(cacheKey);
+  const keyOf = (id: string) => `${accountId}:${dataset}:${id}`;
 
-  const pending = viewsInFlight.get(cacheKey);
-  if (pending) return pending;
+  const views: Record<string, number> = {};
+  const waiters: Array<{ id: string; promise: Promise<{ views: number; missingDataset: boolean }> }> = [];
+  const toFetch: string[] = [];
 
-  const task = (async (): Promise<Exclude<AnalyticsViewsResponse, { enabled: false }>> => {
+  for (const id of cleanIds) {
+    const k = keyOf(id);
+    const cached = viewsCache.get(k);
+    if (cached && cached.exp > nowMs) {
+      views[id] = cached.views;
+      continue;
+    }
+    if (cached) viewsCache.delete(k);
+
+    const pending = viewsInFlight.get(k);
+    if (pending) {
+      waiters.push({ id, promise: pending });
+    } else {
+      toFetch.push(id);
+    }
+  }
+
+  if (toFetch.length > 0) {
+    toFetch.sort();
     const sinceSec = Math.floor(nowMs / 1000) - VIEWS_WINDOW_DAYS * 86400;
-    const idList = sortedIds.map((id) => `'${id}'`).join(', ');
+    const idList = toFetch.map((id) => `'${id}'`).join(', ');
     const sql = `SELECT index1 AS id, SUM(_sample_interval) AS views FROM ${dataset} WHERE blob1 = 'view' AND index1 IN (${idList}) AND timestamp >= toDateTime(${sinceSec}) AND blob5 NOT IN ('bot', 'cli') GROUP BY id FORMAT JSON`;
-    const res = await runSql<{ id: string; views: number | string }>(env, sql, dataset);
-    const views: Record<string, number> = {};
-    for (const id of sortedIds) views[id] = 0;
-    for (const row of res.data) {
-      const id = String(row.id ?? '').trim();
-      if (Object.hasOwn(views, id)) views[id] = toInt(row.views);
-    }
-    const result: Exclude<AnalyticsViewsResponse, { enabled: false }> = {
-      enabled: true,
-      ...(res.missingDataset ? { dataset_missing: true } : {}),
-      window_days: VIEWS_WINDOW_DAYS,
-      views,
-    };
-    if (!res.missingDataset) {
-      if (viewsCache.size >= CACHE_MAX) {
-        const oldest = viewsCache.keys().next().value;
-        if (oldest !== undefined) viewsCache.delete(oldest);
-      }
-      viewsCache.set(cacheKey, { exp: Date.now() + CACHE_TTL_MS, data: result });
-    }
-    return result;
-  })().finally(() => {
-    if (viewsInFlight.get(cacheKey) === task) viewsInFlight.delete(cacheKey);
-  });
 
-  viewsInFlight.set(cacheKey, task);
-  return task;
+    const batchPromise = (async () => {
+      const res = await runSql<{ id: string; views: number | string }>(env, sql, dataset);
+      const fetched = new Map<string, number>();
+      for (const id of toFetch) fetched.set(id, 0);
+      for (const row of res.data) {
+        const id = String(row.id ?? '').trim();
+        if (fetched.has(id)) fetched.set(id, toInt(row.views));
+      }
+      if (!res.missingDataset) {
+        const exp = Date.now() + CACHE_TTL_MS;
+        for (const [id, count] of fetched) {
+          setBoundedCache(viewsCache, keyOf(id), { exp, views: count }, VIEWS_CACHE_MAX);
+        }
+      }
+      return { fetched, missingDataset: res.missingDataset };
+    })();
+
+    for (const id of toFetch) {
+      const k = keyOf(id);
+      const perIdPromise = batchPromise
+        .then(({ fetched, missingDataset }) => ({ views: fetched.get(id) ?? 0, missingDataset }))
+        .finally(() => {
+          if (viewsInFlight.get(k) === perIdPromise) viewsInFlight.delete(k);
+        });
+      viewsInFlight.set(k, perIdPromise);
+      waiters.push({ id, promise: perIdPromise });
+    }
+  }
+
+  let missingDataset = false;
+  if (waiters.length > 0) {
+    const settled = await Promise.all(waiters.map((w) => w.promise));
+    for (let i = 0; i < waiters.length; i++) {
+      views[waiters[i].id] = settled[i].views;
+      if (settled[i].missingDataset) missingDataset = true;
+    }
+  }
+
+  return {
+    enabled: true,
+    ...(missingDataset ? { dataset_missing: true } : {}),
+    window_days: VIEWS_WINDOW_DAYS,
+    views,
+  };
 }

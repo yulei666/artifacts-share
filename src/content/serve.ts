@@ -273,7 +273,7 @@ export async function serveFile(
   if (cacheable && status === 200 && servedPath === path && obj.size <= EDGE_CACHE_MAX_BYTES) {
     const cached = res.clone();
     const cacheHeaders = new Headers(cached.headers);
-    cacheHeaders.set('cache-control', 'public, max-age=60');
+    cacheHeaders.set('cache-control', 'public, max-age=86400');
     ctx.waitUntil(caches.default.put(cacheKey, new Response(cached.body, { headers: cacheHeaders })));
   }
   return res;

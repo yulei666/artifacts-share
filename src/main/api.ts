@@ -199,11 +199,16 @@ api.get('/artifacts', async (c) => {
 });
 
 api.get('/artifacts/:id', async (c) => {
-  const a = await requireArtifact(c.env, idParam(c));
-  const v = await c.env.DB.prepare('SELECT file_count, total_size FROM artifact_versions WHERE artifact_id = ? AND version = ?')
-    .bind(a.id, a.current_version)
-    .first<{ file_count: number; total_size: number }>();
-  return c.json({ ...(await view(c, a)), file_count: v?.file_count ?? 0, total_size: v?.total_size ?? 0 });
+  const id = idParam(c);
+  const a = await c.env.DB.prepare(
+    `SELECT a.*, v.file_count, v.total_size FROM artifacts a
+     LEFT JOIN artifact_versions v ON v.artifact_id = a.id AND v.version = a.current_version
+     WHERE a.id = ? AND a.deleted_at IS NULL`,
+  )
+    .bind(id)
+    .first<ArtifactRow & { file_count: number | null; total_size: number | null }>();
+  if (!a) throw new HttpError(404, 'not_found', 'Artifact not found');
+  return c.json({ ...(await view(c, a)), file_count: a.file_count ?? 0, total_size: a.total_size ?? 0 });
 });
 
 api.patch('/artifacts/:id', async (c) => {
@@ -245,13 +250,13 @@ api.post('/artifacts/:id/versions/:v/activate', async (c) => {
   if (!Number.isInteger(version)) throw new HttpError(404, 'version_not_found', 'Version not found');
   const { entry, kind } = await versionEntryAndKind(c.env, a, version);
   // Guarded: the daily cleanup may retire this version between the check above and here.
-  const res = await c.env.DB.prepare(
-    "UPDATE artifacts SET current_version = ?1, entry = ?2, kind = ?3, updated_at = ?4 WHERE id = ?5 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM artifact_versions WHERE artifact_id = ?5 AND version = ?1 AND status = 'ready')",
+  const updated = await c.env.DB.prepare(
+    "UPDATE artifacts SET current_version = ?1, entry = ?2, kind = ?3, updated_at = ?4 WHERE id = ?5 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM artifact_versions WHERE artifact_id = ?5 AND version = ?1 AND status = 'ready') RETURNING *",
   )
     .bind(version, entry, kind, now(), a.id)
-    .run();
-  if (!res.meta.changes) throw new HttpError(404, 'version_not_found', 'Version not found');
-  return c.json(await view(c, await requireArtifact(c.env, a.id)));
+    .first<ArtifactRow>();
+  if (!updated) throw new HttpError(404, 'version_not_found', 'Version not found');
+  return c.json(await view(c, updated));
 });
 
 api.get('/artifacts/:id/files', async (c) => {
@@ -331,7 +336,7 @@ api.post('/uploads', async (c) => {
 
 api.put('/uploads/:uid/files/*', async (c) => {
   const u = await requireUpload(c.env, c.req.param('uid'));
-  const settings = await getSettings(c.env, { fresh: true });
+  const settings = await getSettings(c.env);
   const len = c.req.header('content-length');
   const size = len !== undefined ? Number(len) : null;
   // R2 needs a known length for streams; chunked bodies are buffered, but only up to the file-size limit.

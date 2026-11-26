@@ -46,15 +46,19 @@ export function disposition(name: string): string {
   return `attachment; filename="${ascii}"; filename*=UTF-8''${ext}`;
 }
 
+function singleFileName(a: ArtifactRow): string {
+  const entryName = a.entry.split('/').pop()!;
+  const ext = entryName.slice(entryName.lastIndexOf('.'));
+  return fileName(a.title, entryName.slice(0, -ext.length), ext);
+}
+
 /** What the download button will produce (shown in its label). */
 export async function downloadSummary(env: Env, a: ArtifactRow) {
   if (a.kind !== 'folder') {
     const f = await env.DB.prepare('SELECT size FROM artifact_files WHERE artifact_id = ? AND version = ? AND path = ?')
       .bind(a.id, a.current_version, a.entry)
       .first<{ size: number }>();
-    const entryName = a.entry.split('/').pop()!;
-    const ext = entryName.slice(entryName.lastIndexOf('.'));
-    return { kind: a.kind, name: fileName(a.title, entryName.slice(0, -ext.length), ext), size: f?.size ?? 0, file_count: 1 };
+    return { kind: a.kind, name: singleFileName(a), size: f?.size ?? 0, file_count: 1 };
   }
   const v = await env.DB.prepare('SELECT file_count, total_size FROM artifact_versions WHERE artifact_id = ? AND version = ?')
     .bind(a.id, a.current_version)
@@ -116,16 +120,17 @@ export function registerDownloadRoutes(
     // error in the UI instead of the browser saving the error body as a "downloaded" file.
     if (c.req.query('check') === '1') return c.json({ ok: true });
 
-    const summary = await downloadSummary(c.env, a);
+    const isZip = a.kind === 'folder';
+    const name = isZip ? fileName(a.title, 'artifact', '.zip') : singleFileName(a);
     const headers = new Headers({
-      'content-disposition': disposition(summary.name),
+      'content-disposition': disposition(name),
       // Never render downloaded content on the main origin.
       'content-security-policy': 'sandbox',
       'x-content-type-options': 'nosniff',
       'cache-control': 'private, no-store',
     });
 
-    if (summary.kind !== 'zip') {
+    if (!isZip) {
       const key = r2Key(a.id, a.current_version!, a.entry);
       const obj = c.req.method === 'HEAD' ? await c.env.BUCKET.head(key) : await c.env.BUCKET.get(key);
       if (!obj) throw new HttpError(404, 'not_found', 'File not found');
@@ -138,11 +143,13 @@ export function registerDownloadRoutes(
 
     headers.set('content-type', 'application/zip');
     if (c.req.method === 'HEAD') return new Response(null, { headers });
-    const { results } = await c.env.DB.prepare('SELECT path, size, content_type FROM artifact_files WHERE artifact_id = ? AND version = ? ORDER BY path')
-      .bind(a.id, a.current_version)
-      .all<ZipFile>();
-    const ver = await c.env.DB.prepare('SELECT created_at FROM artifact_versions WHERE artifact_id = ? AND version = ?').bind(a.id, a.current_version).first<{ created_at: number }>();
-    if (!v.owner && c.req.method === 'GET') recordDownload(c.env, c.executionCtx, c.req.raw, a, 'zip', summary.size);
-    return new Response(streamZip(c.env, c.executionCtx, a.id, a.current_version!, results, new Date((ver?.created_at ?? now()) * 1000)), { headers });
+    const [verRes, filesRes] = await c.env.DB.batch([
+      c.env.DB.prepare('SELECT file_count, total_size, created_at FROM artifact_versions WHERE artifact_id = ? AND version = ?').bind(a.id, a.current_version),
+      c.env.DB.prepare('SELECT path, size, content_type FROM artifact_files WHERE artifact_id = ? AND version = ? ORDER BY path').bind(a.id, a.current_version),
+    ]);
+    const ver = (verRes.results[0] as { file_count: number; total_size: number; created_at: number } | undefined) ?? null;
+    const files = filesRes.results as ZipFile[];
+    if (!v.owner && c.req.method === 'GET') recordDownload(c.env, c.executionCtx, c.req.raw, a, 'zip', ver?.total_size ?? 0);
+    return new Response(streamZip(c.env, c.executionCtx, a.id, a.current_version!, files, new Date((ver?.created_at ?? now()) * 1000)), { headers });
   });
 }
