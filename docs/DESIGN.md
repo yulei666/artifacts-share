@@ -484,7 +484,7 @@ Base：`https://share.example.com`
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/api/v1/artifacts` | 创建（形态 A/B/C）；参数 `title`、`visibility`、`entry`、`spa_fallback`、`indexable`（query 或 `X-Artifact-*` 头） |
-| `GET` | `/api/v1/artifacts?cursor=&limit=&q=&visibility=` | 列表 |
+| `GET` | `/api/v1/artifacts?cursor=&limit=&q=&visibility=` | 列表；`q` 按空白（含全角空格）拆词做多关键词 `AND` 匹配（`title` 子串或 `id`/`public_id` 前缀，去重后最多 8 个词） |
 | `GET` | `/api/v1/artifacts/{id}` | 详情（含 `url`；凭密时含 `password`） |
 | `PATCH` | `/api/v1/artifacts/{id}` | 改 `title` / `visibility` / `entry` / `spa_fallback` / `indexable`；切到 password 时自动生成访问码 |
 | `POST` | `/api/v1/artifacts/{id}/password/reset` | 重新生成访问码 |

@@ -148,10 +148,23 @@ api.get('/artifacts', async (c) => {
   const where = ['a.deleted_at IS NULL'];
   const binds: unknown[] = [];
   if (q) {
-    where.push("(a.title LIKE ? ESCAPE '\\' OR a.id LIKE ? ESCAPE '\\' OR a.public_id LIKE ? ESCAPE '\\')");
     const esc = (s: string) => s.replace(/[\\%_]/g, (m) => '\\' + m);
-    const prefix = `${esc(q.toLowerCase())}%`;
-    binds.push(`%${esc(q)}%`, prefix, prefix);
+    // Deduplicate case-insensitively on ASCII (matching SQLite LIKE) and cap to 8 terms to bound scan cost.
+    const seen = new Set<string>();
+    const terms: string[] = [];
+    for (const term of q.split(/\s+/)) {
+      if (!term) continue;
+      const key = term.replace(/[A-Z]/g, (c) => c.toLowerCase());
+      if (seen.has(key)) continue;
+      seen.add(key);
+      terms.push(term);
+      if (terms.length >= 8) break;
+    }
+    for (const term of terms) {
+      where.push("(a.title LIKE ? ESCAPE '\\' OR a.id LIKE ? ESCAPE '\\' OR a.public_id LIKE ? ESCAPE '\\')");
+      const prefix = `${esc(term.toLowerCase())}%`;
+      binds.push(`%${esc(term)}%`, prefix, prefix);
+    }
   }
   if (vis) {
     where.push('a.visibility = ?');
