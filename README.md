@@ -123,7 +123,7 @@ CF_ACCOUNT_ID = "你的 Cloudflare Account ID"
 npx wrangler secret put CF_API_TOKEN
 ```
 
-启用后顶栏会出现 **统计**（`#/analytics`）全站分析页，每个 artifact 详情页也会提供按需展开的 **访问统计** 折叠卡片（保留近 90 天明细；D1 的 `view_count` 继续作为永久累计浏览数）。
+启用后顶栏会出现 **统计**（`#/analytics`）全站分析页，每个 artifact 详情页也会提供按需展开的 **访问统计** 折叠卡片（保留近 90 天明细）；同时每次访客浏览将跳过 D1 `view_count` 写入，列表页与详情页的访问次数异步读取 Analytics Engine 的近 90 天统计（不含爬虫）。未配置时仍使用 D1 `view_count`（并自动过滤爬虫与预加载）。
 
 ## SSO 配置
 

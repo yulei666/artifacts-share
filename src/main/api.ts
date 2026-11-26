@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import type { ArtifactRow } from '../env';
 import { isUuid } from '../lib/hosts';
 import { disposition } from './download';
-import { parseAnalyticsParams, queryAnalytics } from '../lib/analytics';
+import { parseAnalyticsParams, parseViewsIds, queryAnalytics, queryAnalyticsViews } from '../lib/analytics';
 import { HttpError, now, readBodyLimited, readJsonObject } from '../lib/http';
 import { getSettings, type Settings } from '../lib/settings';
 import {
@@ -295,6 +295,11 @@ api.delete('/artifacts/:id', async (c) => {
 api.get('/analytics', async (c) => {
   const opts = parseAnalyticsParams(new URL(c.req.url));
   return c.json(await queryAnalytics(c.env, opts));
+});
+
+api.get('/analytics/views', async (c) => {
+  const ids = parseViewsIds(new URL(c.req.url));
+  return c.json(await queryAnalyticsViews(c.env, ids));
 });
 
 api.get('/artifacts/:id/analytics', async (c) => {

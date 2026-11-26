@@ -2,7 +2,7 @@ import { env, exports } from 'cloudflare:workers';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/env';
 import worker from '../src/index';
-import { analyticsEnabled, classifyDevice, classifyReferer, clearAnalyticsCache, INTERNAL_REFERER, normalizeRefererHost, resolveDataset } from '../src/lib/analytics';
+import { analyticsEnabled, classifyDevice, classifyReferer, classifyRequestDevice, clearAnalyticsCache, INTERNAL_REFERER, isPrefetchRequest, isVerifiedBot, normalizeRefererHost, resolveDataset, shouldCountView } from '../src/lib/analytics';
 
 const MAIN = 'https://share.example.com';
 const ORIGIN = { origin: MAIN };
@@ -194,6 +194,27 @@ describe('analytics config & helpers', () => {
     expect(classifyDevice('Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15')).toBe('tablet');
     expect(classifyDevice('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148')).toBe('mobile');
     expect(classifyDevice('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36')).toBe('desktop');
+  });
+
+  it('detects Cloudflare verified bots and browser prefetches in shouldCountView', () => {
+    const browserUa = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36';
+    const normal = new Request('https://example.com/', { headers: { 'user-agent': browserUa } });
+    expect(isVerifiedBot(normal)).toBe(false);
+    expect(isPrefetchRequest(normal)).toBe(false);
+    expect(classifyRequestDevice(normal)).toBe('desktop');
+    expect(shouldCountView(normal)).toBe(true);
+
+    const verifiedBot = new Request('https://example.com/', { headers: { 'user-agent': browserUa } });
+    Object.defineProperty(verifiedBot, 'cf', { value: { botManagement: { verifiedBot: true } } });
+    expect(isVerifiedBot(verifiedBot)).toBe(true);
+    expect(classifyRequestDevice(verifiedBot)).toBe('bot');
+    expect(shouldCountView(verifiedBot)).toBe(false);
+
+    expect(shouldCountView(new Request('https://example.com/', { headers: { 'user-agent': browserUa, 'sec-purpose': 'prefetch' } }))).toBe(false);
+    expect(shouldCountView(new Request('https://example.com/', { headers: { 'user-agent': browserUa, 'sec-purpose': 'prefetch;prerender' } }))).toBe(false);
+    expect(shouldCountView(new Request('https://example.com/', { headers: { 'user-agent': browserUa, purpose: 'prefetch' } }))).toBe(false);
+    expect(shouldCountView(new Request('https://example.com/', { headers: { 'user-agent': 'curl/8.4.0' } }))).toBe(false);
+    expect(shouldCountView(new Request('https://example.com/'))).toBe(false);
   });
 });
 
@@ -575,6 +596,9 @@ describe('analytics read APIs', () => {
           ],
         });
       }
+      if (sql.startsWith('SELECT SUM(_sample_interval) AS total FROM')) {
+        return Response.json({ data: [{ total: 42 }] });
+      }
       return Response.json({ data: [] });
     });
 
@@ -583,7 +607,7 @@ describe('analytics read APIs', () => {
     expect(detailRes.enabled).toBe(true);
     expect(detailRes.range).toBe('7d');
     expect(detailRes.bucket).toBe('day');
-    expect(detailRes.totals).toEqual({ views: 25, visitors: 10, downloads: 4, all_time_views: 42 });
+    expect(detailRes.totals).toEqual({ views: 25, visitors: 10, downloads: 4, views_90d: 42 });
     expect(detailRes.series).toHaveLength(7);
     expect(detailRes.series[6]).toEqual({ ts: todayBucket, views: 15, visitors: 7, downloads: 2 });
     expect(detailRes.series[0].views).toBe(0);
@@ -596,9 +620,10 @@ describe('analytics read APIs', () => {
       { path: 'docs/guide.md', views: 15 },
       { path: 'index.html', views: 10 },
     ]);
+    const rangeQueries = (list: string[]) => list.filter((q) => !q.startsWith('SELECT SUM(_sample_interval) AS total FROM'));
     expect(queries.every((q) => q.includes(`index1 = '${folder.id}'`))).toBe(true);
     expect(queries.every((q) => q.includes("blob5 NOT IN ('bot', 'cli')"))).toBe(true);
-    expect(queries.every((q) => q.includes(`timestamp >= toDateTime(${detailRes.series[0].ts})`))).toBe(true);
+    expect(rangeQueries(queries).every((q) => q.includes(`timestamp >= toDateTime(${detailRes.series[0].ts})`))).toBe(true);
     expect(queries.some((q) => q.includes(`toUInt32(timestamp) + ${shift}`))).toBe(true);
     expect(queries.some((q) => q.includes(`blob4 != '${INTERNAL_REFERER}'`) && q.includes('AS hits'))).toBe(true);
     expect(urls.every((u) => u === 'https://api.cloudflare.com/client/v4/accounts/acct-12345/analytics_engine/sql')).toBe(true);
@@ -614,8 +639,8 @@ describe('analytics read APIs', () => {
     const siteRes = await json(await api('/api/v1/analytics?range=24h&tz=0&bots=1', { env: testEnv }), 200);
     expect(siteRes.bucket).toBe('hour');
     expect(siteRes.series).toHaveLength(24);
-    expect(queries.every((q) => q.includes(`timestamp >= toDateTime(${siteRes.series[0].ts})`))).toBe(true);
-    expect(siteRes.totals.all_time_views).toBeGreaterThanOrEqual(42);
+    expect(rangeQueries(queries).every((q) => q.includes(`timestamp >= toDateTime(${siteRes.series[0].ts})`))).toBe(true);
+    expect(siteRes.totals.views_90d).toBe(42);
     expect(siteRes.top_artifacts).toEqual([
       { id: folder.id, title: 'TopFolder', kind: 'folder', visibility: 'public', deleted: false, views: 25, visitors: 10 },
       { id: '11111111-1111-4111-8111-111111111111', title: '', kind: null, visibility: null, deleted: true, views: 3, visitors: 2 },
@@ -631,8 +656,8 @@ describe('analytics read APIs', () => {
     ]);
     const negTzRes = await json(rA, 200);
     expect(await json(rB, 200)).toEqual(negTzRes);
-    expect(fetchMock.mock.calls.length - beforeDedupCount).toBe(6); // deduplicated into a single 6-query batch
-    expect(queries.every((q) => q.includes(`timestamp >= toDateTime(${negTzRes.series[0].ts})`))).toBe(true);
+    expect(fetchMock.mock.calls.length - beforeDedupCount).toBe(7); // deduplicated into a single 7-query batch (6 range + 1 views_90d)
+    expect(rangeQueries(queries).every((q) => q.includes(`timestamp >= toDateTime(${negTzRes.series[0].ts})`))).toBe(true);
     expect(queries.some((q) => q.includes(`toUInt32(timestamp) + ${86400 - 300 * 60}`))).toBe(true);
 
     // Changing artifact.kind or CF_ACCOUNT_ID does not reuse stale cache entry
@@ -733,5 +758,134 @@ describe('analytics read APIs', () => {
     const badDsRes = await api('/api/v1/analytics', { env: { ...testEnv, ANALYTICS_DATASET: 'bad-name;drop' } });
     expect(badDsRes.status).toBe(500);
     expect((await badDsRes.json<any>()).error.code).toBe('invalid_analytics_config');
+  });
+
+  it('skips D1 view_count writes when WAE is enabled, skips prefetch on view/referral, and tags verified bots', async () => {
+    const a = await createArtifact('<h1>WAE only</h1>', 'text/html', '?visibility=public&title=WaeOnly');
+    const { testEnv, points } = makeAnalyticsEnv();
+    const browserUa = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36';
+
+    const res = await callWorker(testEnv, a.content_url, {
+      headers: { 'sec-fetch-dest': 'iframe', 'user-agent': browserUa },
+    });
+    expect(res.status).toBe(200);
+    await res.arrayBuffer();
+    await flushAll();
+
+    // WAE recorded the view, while D1 view_count stayed 0 (no D1 write on view when WAE is enabled).
+    expect(points).toHaveLength(1);
+    expect(points[0].blobs?.[0]).toBe('view');
+    expect((await json(await api(`/api/v1/artifacts/${a.id}`), 200)).view_count).toBe(0);
+
+    // Browser prefetch skips both view and /s/:pid referral in WAE (and D1).
+    const prefetchRes = await callWorker(testEnv, a.content_url, {
+      headers: { 'sec-fetch-dest': 'document', 'user-agent': browserUa, 'sec-purpose': 'prefetch' },
+    });
+    expect(prefetchRes.status).toBe(200);
+    await prefetchRes.arrayBuffer();
+    const prefetchRef = await callWorker(testEnv, a.url, {
+      headers: { 'user-agent': browserUa, 'sec-purpose': 'prefetch;prerender', referer: 'https://news.ycombinator.com/' },
+    });
+    expect(prefetchRef.status).toBe(200);
+    await prefetchRef.arrayBuffer();
+    await flushAll();
+    expect(points).toHaveLength(1);
+
+    // End-to-end Cloudflare verifiedBot with a desktop browser UA: tagged as 'bot' in WAE, and skips D1 view_count when WAE is off.
+    const verifiedReqWae = new Request(a.content_url, { headers: { 'sec-fetch-dest': 'document', 'user-agent': browserUa } });
+    Object.defineProperty(verifiedReqWae, 'cf', { value: { botManagement: { verifiedBot: true } } });
+    const ctx1 = makeCtx();
+    const botWaeRes = await worker.fetch(verifiedReqWae as unknown as Request<unknown, IncomingRequestCfProperties>, testEnv, ctx1.ctx);
+    expect(botWaeRes.status).toBe(200);
+    await botWaeRes.arrayBuffer();
+    await ctx1.flush();
+    expect(points).toHaveLength(2);
+    expect(points[1].blobs?.[4]).toBe('bot');
+
+    const verifiedReqNoWae = new Request(a.content_url, { headers: { 'sec-fetch-dest': 'document', 'user-agent': browserUa } });
+    Object.defineProperty(verifiedReqNoWae, 'cf', { value: { botManagement: { verifiedBot: true } } });
+    const ctx2 = makeCtx();
+    const botD1Res = await worker.fetch(verifiedReqNoWae as unknown as Request<unknown, IncomingRequestCfProperties>, { ...testEnv, ANALYTICS: undefined }, ctx2.ctx);
+    expect(botD1Res.status).toBe(200);
+    await botD1Res.arrayBuffer();
+    await ctx2.flush();
+    expect((await json(await api(`/api/v1/artifacts/${a.id}`), 200)).view_count).toBe(0);
+  });
+
+  it('serves batch 90-day view counts via /api/v1/analytics/views with auth, validation, dedup, caching, and error handling', async () => {
+    const a = await createArtifact('<p>a</p>', 'text/html', '?visibility=public&title=A');
+    const b = await createArtifact('<p>b</p>', 'text/html', '?visibility=public&title=B');
+    const { testEnv } = makeAnalyticsEnv({ ANALYTICS_DATASET: 'views_ds' });
+
+    // Requires authentication
+    expect((await api(`/api/v1/analytics/views?ids=${a.id}`, { auth: 'none', env: testEnv })).status).toBe(401);
+
+    // Disabled when WAE config is incomplete
+    expect(await json(await api(`/api/v1/analytics/views?ids=${a.id}`, { env: { ...testEnv, CF_API_TOKEN: '' } }), 200)).toEqual({ enabled: false });
+
+    // Validation: empty ids returns empty map without upstream query; invalid UUID or >100 IDs return 400
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const sql = String(init?.body ?? '');
+      expect(sql).toContain('FROM views_ds');
+      expect(sql).toContain("blob1 = 'view'");
+      expect(sql).toContain("blob5 NOT IN ('bot', 'cli')");
+      expect(sql).toContain(`index1 IN ('${[a.id, b.id].sort().join("', '")}')`);
+      return Response.json({ data: [{ id: a.id, views: 19 }] });
+    });
+
+    expect(await json(await api('/api/v1/analytics/views', { env: testEnv }), 200)).toEqual({ enabled: true, window_days: 90, views: {} });
+    expect(spy).not.toHaveBeenCalled();
+
+    expect((await api('/api/v1/analytics/views?ids=not-a-uuid', { env: testEnv })).status).toBe(400);
+    const tooMany = Array.from({ length: 101 }, (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`).join(',');
+    expect((await api(`/api/v1/analytics/views?ids=${tooMany}`, { env: testEnv })).status).toBe(400);
+
+    // Concurrent calls with differently-ordered / duplicate IDs deduplicate via viewsInFlight into 1 SQL call and cache.
+    const [p1, p2] = await Promise.all([
+      api(`/api/v1/analytics/views?ids=${b.id},${a.id},${b.id}`, { env: testEnv }),
+      api(`/api/v1/analytics/views?ids=${a.id},${b.id}`, { env: testEnv }),
+    ]);
+    const r1 = await json(p1, 200);
+    expect(r1).toEqual({ enabled: true, window_days: 90, views: { [a.id]: 19, [b.id]: 0 } });
+    expect(await json(p2, 200)).toEqual(r1);
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    const r3 = await json(await api(`/api/v1/analytics/views?ids=${a.id},${b.id}`, { env: testEnv }), 200);
+    expect(r3).toEqual(r1);
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    // range=90d in queryAnalytics still runs rolling views_90d query consistently.
+    clearAnalyticsCache();
+    const ninetySqls: string[] = [];
+    spy.mockImplementation(async (_input, init) => {
+      const sql = String(init?.body ?? '');
+      ninetySqls.push(sql);
+      if (sql.startsWith('SELECT SUM(_sample_interval) AS total FROM')) return Response.json({ data: [{ total: 50 }] });
+      if (sql.includes('GROUP BY event') && !sql.includes('GROUP BY bucket_ts')) return Response.json({ data: [{ event: 'view', total: 30, uv: 10, no_ref: 0 }] });
+      return Response.json({ data: [] });
+    });
+    const ninety = await json(await api(`/api/v1/artifacts/${a.id}/analytics?range=90d&tz=480&bots=0`, { env: testEnv }), 200);
+    expect(ninety.totals.views_90d).toBe(50);
+    expect(ninetySqls.some((s) => s.startsWith('SELECT SUM(_sample_interval) AS total FROM'))).toBe(true);
+
+    // dataset_missing returns zeros without caching
+    clearAnalyticsCache();
+    spy.mockImplementation(async () => new Response('Table views_ds does not exist', { status: 400 }));
+    const missing = await json(await api(`/api/v1/analytics/views?ids=${a.id}`, { env: testEnv }), 200);
+    expect(missing).toEqual({ enabled: true, dataset_missing: true, window_days: 90, views: { [a.id]: 0 } });
+    const callsAfterMissing = spy.mock.calls.length;
+    await json(await api(`/api/v1/analytics/views?ids=${a.id}`, { env: testEnv }), 200);
+    expect(spy.mock.calls.length).toBe(callsAfterMissing + 1);
+
+    // Upstream 502 error is not cached
+    clearAnalyticsCache();
+    spy.mockImplementationOnce(async () => new Response('Upstream error', { status: 500 }));
+    expect((await api(`/api/v1/analytics/views?ids=${a.id}`, { env: testEnv })).status).toBe(502);
+    spy.mockImplementationOnce(async () => Response.json({ data: [{ id: a.id, views: 7 }] }));
+    expect(await json(await api(`/api/v1/analytics/views?ids=${a.id}`, { env: testEnv }), 200)).toEqual({
+      enabled: true,
+      window_days: 90,
+      views: { [a.id]: 7 },
+    });
   });
 });

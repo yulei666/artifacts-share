@@ -35,6 +35,7 @@ const fmtAgo = (s) => {
 };
 const visLabel = (v) => t(`vis.${v}`);
 const badge = (v) => h('span', { class: `badge ${v}` }, visLabel(v));
+const infoTip = (text) => h('span', { class: 'info-tip', tabindex: '0', role: 'img', 'aria-label': text, 'data-tip': text }, 'i');
 const encodePath = (p) => p.split('/').map(encodeURIComponent).join('/');
 
 const langButton = (extraClass = '') =>
@@ -282,11 +283,15 @@ function viewSetup() {
 // ---------------- list ----------------
 
 async function viewList() {
+  const useWae = !!me?.analytics_enabled;
   const search = h('input', { type: 'search', placeholder: t('list.search') });
   const vis = h('select', {}, h('option', { value: '' }, t('list.all')), ...VISIBILITIES.map((v) => h('option', { value: v }, visLabel(v))));
   vis.style.width = 'auto';
   const tbody = h('tbody');
   const more = h('button', { class: 'sm', hidden: true }, t('common.loadMore'));
+  const viewsTh = useWae
+    ? h('th', { class: 'hide-sm' }, h('span', { class: 'th-with-tip' }, t('list.colViews'), infoTip(t('list.colViews90dHint'))))
+    : h('th', { class: 'hide-sm' }, t('list.colViews'));
   const wrap = h(
     'div',
     { class: 'table-wrap' },
@@ -296,7 +301,7 @@ async function viewList() {
       h(
         'thead',
         {},
-        h('tr', {}, h('th', {}, t('list.colTitle')), h('th', {}, t('list.colAccess')), h('th', { class: 'hide-sm' }, t('list.colSize')), h('th', { class: 'hide-sm' }, t('list.colViews')), h('th', {}, t('list.colUpdated'))),
+        h('tr', {}, h('th', {}, t('list.colTitle')), h('th', {}, t('list.colAccess')), h('th', { class: 'hide-sm' }, t('list.colSize')), viewsTh, h('th', {}, t('list.colUpdated'))),
       ),
       tbody,
     ),
@@ -304,6 +309,24 @@ async function viewList() {
   const empty = h('div', { class: 'card empty', hidden: true }, h('p', {}, t('list.empty')), h('p', {}, h('a', { href: '#/new' }, t('list.emptyCta'))));
   let cursor = null;
   let seq = 0; // only the latest request may touch the table
+
+  async function loadViews(cells) {
+    const ids = [...cells.keys()];
+    if (!ids.length) return;
+    try {
+      const res = await api('GET', `/api/v1/analytics/views?ids=${encodeURIComponent(ids.join(','))}`);
+      for (const [id, cell] of cells) {
+        if (!cell.isConnected) continue;
+        cell.textContent = res?.enabled ? Number(res.views?.[id] ?? 0).toLocaleString(locale()) : '—';
+      }
+    } catch {
+      for (const cell of cells.values()) {
+        if (!cell.isConnected) continue;
+        cell.textContent = '—';
+        cell.title = t('analytics.loadFailed');
+      }
+    }
+  }
 
   async function load(reset) {
     const mine = ++seq;
@@ -320,7 +343,12 @@ async function viewList() {
     }
     if (mine !== seq || !tbody.isConnected) return;
     if (reset) tbody.replaceChildren();
+    const pageCells = new Map();
     for (const a of data.items) {
+      const viewCell = useWae
+        ? h('td', { class: 'hide-sm muted', title: t('list.colViews90dHint') }, '…')
+        : h('td', { class: 'hide-sm muted' }, a.view_count);
+      if (useWae) pageCells.set(a.id, viewCell);
       tbody.append(
         h(
           'tr',
@@ -333,7 +361,7 @@ async function viewList() {
           ),
           h('td', {}, badge(a.visibility)),
           h('td', { class: 'hide-sm muted' }, fmtBytes(a.total_size)),
-          h('td', { class: 'hide-sm muted' }, a.view_count),
+          viewCell,
           h('td', { class: 'muted' }, fmtAgo(a.updated_at)),
         ),
       );
@@ -343,6 +371,7 @@ async function viewList() {
     const none = tbody.children.length === 0;
     wrap.hidden = none;
     empty.hidden = !none || !!search.value.trim() || !!vis.value;
+    if (useWae && pageCells.size) loadViews(pageCells);
   }
 
   let timer;
@@ -794,6 +823,10 @@ async function viewDetail(id) {
     });
   }
 
+  const useWae = !!me?.analytics_enabled;
+  const viewsLabel = useWae ? [t('detail.views'), infoTip(t('list.colViews90dHint'))] : t('detail.views');
+  const viewsVal = useWae ? h('div', { class: 'v muted' }, '…') : h('div', { class: 'v' }, a.view_count);
+
   mount(
     h('div', { class: 'page-head' }, h('div', { class: 'row' }, h('a', { href: '#/', class: 'muted' }, t('detail.back'))), h('a', { class: 'btn primary', href: openUrl, target: '_blank', rel: 'noopener' }, t('detail.open'))),
     h(
@@ -812,9 +845,9 @@ async function viewDetail(id) {
             [t('detail.version'), `v${a.current_version}`],
             [t('detail.files'), a.file_count],
             [t('detail.size'), fmtBytes(a.total_size)],
-            [t('detail.views'), a.view_count],
+            [viewsLabel, viewsVal],
             [t('detail.updated'), fmtAgo(a.updated_at)],
-          ].map(([k, v]) => h('div', { class: 'stat' }, h('div', { class: 'k' }, k), h('div', { class: 'v' }, v))),
+          ].map(([k, v]) => h('div', { class: 'stat' }, h('div', { class: 'k' }, k), v instanceof Node ? v : h('div', { class: 'v' }, v))),
         ),
       ),
       h('div', { class: 'card stack' }, h('h2', {}, t('detail.access')), seg, h('p', { class: 'muted' }, t(`detail.help.${a.visibility}`)), passwordBox),
@@ -838,6 +871,20 @@ async function viewDetail(id) {
       h('div', { class: 'row' }, del),
     ),
   );
+
+  if (useWae) {
+    api('GET', `/api/v1/analytics/views?ids=${encodeURIComponent(id)}`)
+      .then((res) => {
+        if (!viewsVal.isConnected) return;
+        viewsVal.classList.remove('muted');
+        viewsVal.textContent = res?.enabled ? Number(res.views?.[id] ?? 0).toLocaleString(locale()) : '—';
+      })
+      .catch(() => {
+        if (!viewsVal.isConnected) return;
+        viewsVal.textContent = '—';
+        viewsVal.title = t('analytics.loadFailed');
+      });
+  }
 }
 
 // ---------------- tokens ----------------

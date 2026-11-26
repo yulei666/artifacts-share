@@ -301,7 +301,7 @@ export function createAnalyticsPanel({ api, artifactId = null, kind = null, onNa
     cleanupChart?.();
     cleanupChart = null;
     lastData = data;
-    const totals = data.totals || { views: 0, visitors: 0, downloads: 0, all_time_views: 0 };
+    const totals = data.totals || { views: 0, visitors: 0, downloads: 0, views_90d: 0 };
 
     const kpis = h(
       'div',
@@ -383,7 +383,8 @@ export function createAnalyticsPanel({ api, artifactId = null, kind = null, onNa
     const legendHint = showPv && showUv ? h('span', { class: 'an-legend-hint muted' }, t('analytics.isolateHint')) : null;
     const hintParts = [];
     if (!showPv && showUv) hintParts.push(t('analytics.scaledUv'));
-    hintParts.push(t('analytics.allTime', { n: fmtNum(data.totals?.all_time_views ?? 0) }));
+    if (data.range === '90d') hintParts.push(t('analytics.window90d'));
+    else hintParts.push(t('analytics.views90d', { n: fmtNum(data.totals?.views_90d ?? 0) }));
     const legendMeta = h('span', { class: 'muted small an-legend-meta' }, hintParts.join(' · '));
     const legend = h('div', { class: 'an-legend' }, h('div', { class: 'an-pills' }, pvPill, uvPill, legendHint), legendMeta);
 

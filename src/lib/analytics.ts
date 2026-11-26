@@ -35,7 +35,7 @@ export type AnalyticsResponse =
         views: number;
         visitors: number;
         downloads: number;
-        all_time_views: number;
+        views_90d: number;
       };
       series: AnalyticsSeriesPoint[];
       countries: Array<{ code: string; views: number }>;
@@ -45,9 +45,20 @@ export type AnalyticsResponse =
       top_artifacts?: AnalyticsTopArtifact[];
     };
 
+export type AnalyticsViewsResponse =
+  | { enabled: false }
+  | {
+      enabled: true;
+      dataset_missing?: boolean;
+      window_days: 90;
+      views: Record<string, number>;
+    };
+
 export const INTERNAL_REFERER = '(internal)';
 const DEFAULT_DATASET = 'artifacts_share_events';
 const DATASET_RE = /^[A-Za-z0-9_]{1,64}$/;
+const VIEWS_WINDOW_DAYS = 90 as const;
+const MAX_VIEWS_IDS = 100;
 const RANGE_CONFIG: Record<AnalyticsRange, { stepSec: number; buckets: number; bucket: 'hour' | 'day' }> = {
   '24h': { stepSec: 3600, buckets: 24, bucket: 'hour' },
   '7d': { stepSec: 86400, buckets: 7, bucket: 'day' },
@@ -59,11 +70,15 @@ const CACHE_TTL_MS = 60_000;
 const CACHE_MAX = 200;
 const queryCache = new Map<string, { exp: number; data: Exclude<AnalyticsResponse, { enabled: false }> }>();
 const inFlight = new Map<string, Promise<Exclude<AnalyticsResponse, { enabled: false }>>>();
+const viewsCache = new Map<string, { exp: number; data: Exclude<AnalyticsViewsResponse, { enabled: false }> }>();
+const viewsInFlight = new Map<string, Promise<Exclude<AnalyticsViewsResponse, { enabled: false }>>>();
 const enc = new TextEncoder();
 
 export function clearAnalyticsCache(): void {
   queryCache.clear();
   inFlight.clear();
+  viewsCache.clear();
+  viewsInFlight.clear();
 }
 
 export function analyticsEnabled(env: Env): boolean {
@@ -127,6 +142,28 @@ export function classifyDevice(ua: string | null): AnalyticsDevice {
   if (TABLET_UA_RE.test(s) || (/android/i.test(s) && !/mobile/i.test(s))) return 'tablet';
   if (MOBILE_UA_RE.test(s)) return 'mobile';
   return 'desktop';
+}
+
+export function isVerifiedBot(req: Request): boolean {
+  const cf = (req as Request & { cf?: { botManagement?: { verifiedBot?: unknown } } }).cf;
+  return cf?.botManagement?.verifiedBot === true;
+}
+
+export function isPrefetchRequest(req: Request): boolean {
+  const p = `${req.headers.get('sec-purpose') ?? ''} ${req.headers.get('purpose') ?? ''}`;
+  return /\b(prefetch|prerender)\b/i.test(p);
+}
+
+export function classifyRequestDevice(req: Request): AnalyticsDevice {
+  if (isVerifiedBot(req)) return 'bot';
+  return classifyDevice(req.headers.get('user-agent'));
+}
+
+/** Whether a page load should increment D1 `view_count` (excludes bots, CLIs, and browser prefetches). */
+export function shouldCountView(req: Request): boolean {
+  if (isPrefetchRequest(req)) return false;
+  const device = classifyRequestDevice(req);
+  return device !== 'bot' && device !== 'cli';
 }
 
 function coarseUaGroup(ua: string | null, device: AnalyticsDevice): string {
@@ -215,7 +252,7 @@ function scheduleWrite(
     const dataset = env.ANALYTICS!;
     const ip = clientIp(req);
     const ua = req.headers.get('user-agent');
-    const device = classifyDevice(ua);
+    const device = classifyRequestDevice(req);
     const uaGroup = coarseUaGroup(ua, device);
     const country = extractCountry(req);
     const refererHost = precomputedReferer ?? classifyReferer(req.headers.get('referer'), env);
@@ -240,6 +277,7 @@ function scheduleWrite(
 
 export function recordView(env: Env, ctx: Pick<ExecutionContext, 'waitUntil'>, req: Request, a: ArtifactRow, servedPath: string, bytes: number): void {
   try {
+    if (isPrefetchRequest(req)) return;
     let refererHost = classifyReferer(req.headers.get('referer'), env);
     if (req.headers.get('sec-fetch-dest') === 'iframe' && refererHost === '') {
       refererHost = INTERNAL_REFERER;
@@ -256,7 +294,7 @@ export function recordDownload(env: Env, ctx: Pick<ExecutionContext, 'waitUntil'
 
 export function recordReferral(env: Env, ctx: Pick<ExecutionContext, 'waitUntil'>, req: Request, a: ArtifactRow): void {
   try {
-    if (!analyticsEnabled(env)) return;
+    if (!analyticsEnabled(env) || isPrefetchRequest(req)) return;
     const refererHost = classifyReferer(req.headers.get('referer'), env);
     if (refererHost === INTERNAL_REFERER) return;
     scheduleWrite(env, ctx, req, a, 'referral', '', 0, refererHost);
@@ -392,22 +430,21 @@ export async function queryAnalytics(
       : needTopArtifacts
         ? `SELECT index1 AS id, SUM(_sample_interval) AS views, COUNT(DISTINCT blob2) AS visitors FROM ${dataset} WHERE blob1 = 'view' AND index1 != '' AND ${timeFilter}${botFilter} GROUP BY id ORDER BY views DESC LIMIT 10 FORMAT JSON`
         : null;
+    const since90d = nowSec - VIEWS_WINDOW_DAYS * 86400;
+    // Always query rolling 90d so `views_90d` stays timezone-independent and matches `/api/v1/analytics/views`.
+    const views90dSql = `SELECT SUM(_sample_interval) AS total FROM ${dataset} WHERE ${scopeFilter}blob1 = 'view' AND timestamp >= toDateTime(${since90d})${botFilter} FORMAT JSON`;
 
-    const [totalsRes, seriesRes, countriesRes, referrersRes, devicesRes, extraRes, siteAllTime] = await Promise.all([
+    const [totalsRes, seriesRes, countriesRes, referrersRes, devicesRes, extraRes, views90dRes] = await Promise.all([
       runSql<{ event: string; total: number | string; uv: number | string; no_ref?: number | string }>(env, totalsSql, dataset),
       runSql<{ bucket_ts: number | string; event: string; total: number | string; uv: number | string }>(env, seriesSql, dataset),
       runSql<{ code: string; views: number | string }>(env, countriesSql, dataset),
       runSql<{ host: string; hits: number | string }>(env, referrersSql, dataset),
       runSql<{ device: string; views: number | string }>(env, devicesSql, dataset),
       extraSql ? runSql<Record<string, unknown>>(env, extraSql, dataset) : Promise.resolve(null),
-      opts.artifact
-        ? Promise.resolve(opts.artifact.view_count)
-        : env.DB.prepare('SELECT COALESCE(SUM(view_count), 0) AS total FROM artifacts WHERE deleted_at IS NULL')
-            .first<{ total: number }>()
-            .then((r) => r?.total ?? 0),
+      runSql<{ total: number | string }>(env, views90dSql, dataset),
     ]);
 
-    const datasetMissing = [totalsRes, seriesRes, countriesRes, referrersRes, devicesRes, extraRes].some((r) => r?.missingDataset);
+    const datasetMissing = [totalsRes, seriesRes, countriesRes, referrersRes, devicesRes, extraRes, views90dRes].some((r) => r?.missingDataset);
 
     let views = 0;
     let visitors = 0;
@@ -425,6 +462,7 @@ export async function queryAnalytics(
         noRefReferrals = toInt(r.no_ref);
       }
     }
+    const views90d = toInt(views90dRes.data[0]?.total);
 
     const series = buildSeries(seriesRes.data, cfg.stepSec, cfg.buckets, currentBucket);
 
@@ -454,7 +492,7 @@ export async function queryAnalytics(
         views,
         visitors,
         downloads,
-        all_time_views: siteAllTime,
+        views_90d: views90d,
       },
       series,
       countries,
@@ -510,5 +548,78 @@ export async function queryAnalytics(
   });
 
   inFlight.set(cacheKey, task);
+  return task;
+}
+
+export function parseViewsIds(url: URL): string[] {
+  const raw = url.searchParams.get('ids') ?? '';
+  if (!raw.trim()) return [];
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const part of raw.split(',')) {
+    const id = part.trim();
+    if (!id) continue;
+    if (!isUuid(id)) throw new HttpError(400, 'invalid_ids', 'Invalid artifact ID');
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length > MAX_VIEWS_IDS) {
+      throw new HttpError(400, 'invalid_ids', `At most ${MAX_VIEWS_IDS} artifact IDs per request`);
+    }
+  }
+  return ids;
+}
+
+/** Batch 90-day view counts (excluding bots/CLIs) from Analytics Engine for artifact list & detail views. */
+export async function queryAnalyticsViews(env: Env, ids: string[]): Promise<AnalyticsViewsResponse> {
+  if (!analyticsEnabled(env)) return { enabled: false };
+  const cleanIds = [...new Set(ids)];
+  if (!cleanIds.length) return { enabled: true, window_days: VIEWS_WINDOW_DAYS, views: {} };
+  if (cleanIds.length > MAX_VIEWS_IDS || cleanIds.some((id) => !isUuid(id))) {
+    throw new HttpError(400, 'invalid_ids', 'Invalid artifact ID');
+  }
+
+  const accountId = env.CF_ACCOUNT_ID!.trim();
+  const dataset = resolveDataset(env);
+  const sortedIds = [...cleanIds].sort();
+  const cacheKey = `${accountId}:${dataset}:${sortedIds.join(',')}`;
+  const nowMs = Date.now();
+  const cached = viewsCache.get(cacheKey);
+  if (cached && cached.exp > nowMs) return cached.data;
+  if (cached) viewsCache.delete(cacheKey);
+
+  const pending = viewsInFlight.get(cacheKey);
+  if (pending) return pending;
+
+  const task = (async (): Promise<Exclude<AnalyticsViewsResponse, { enabled: false }>> => {
+    const sinceSec = Math.floor(nowMs / 1000) - VIEWS_WINDOW_DAYS * 86400;
+    const idList = sortedIds.map((id) => `'${id}'`).join(', ');
+    const sql = `SELECT index1 AS id, SUM(_sample_interval) AS views FROM ${dataset} WHERE blob1 = 'view' AND index1 IN (${idList}) AND timestamp >= toDateTime(${sinceSec}) AND blob5 NOT IN ('bot', 'cli') GROUP BY id FORMAT JSON`;
+    const res = await runSql<{ id: string; views: number | string }>(env, sql, dataset);
+    const views: Record<string, number> = {};
+    for (const id of sortedIds) views[id] = 0;
+    for (const row of res.data) {
+      const id = String(row.id ?? '').trim();
+      if (Object.hasOwn(views, id)) views[id] = toInt(row.views);
+    }
+    const result: Exclude<AnalyticsViewsResponse, { enabled: false }> = {
+      enabled: true,
+      ...(res.missingDataset ? { dataset_missing: true } : {}),
+      window_days: VIEWS_WINDOW_DAYS,
+      views,
+    };
+    if (!res.missingDataset) {
+      if (viewsCache.size >= CACHE_MAX) {
+        const oldest = viewsCache.keys().next().value;
+        if (oldest !== undefined) viewsCache.delete(oldest);
+      }
+      viewsCache.set(cacheKey, { exp: Date.now() + CACHE_TTL_MS, data: result });
+    }
+    return result;
+  })().finally(() => {
+    if (viewsInFlight.get(cacheKey) === task) viewsInFlight.delete(cacheKey);
+  });
+
+  viewsInFlight.set(cacheKey, task);
   return task;
 }

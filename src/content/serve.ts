@@ -5,7 +5,7 @@ import { contentTypeFor, isHtmlPath, isMarkdownPath } from '../lib/mime';
 import { requestPathToKey } from '../lib/paths';
 import { localPath } from '../lib/http';
 import { r2Key } from '../lib/store';
-import { recordView } from '../lib/analytics';
+import { analyticsEnabled, recordView, shouldCountView } from '../lib/analytics';
 import { MARKDOWN_INDEX_MAX_LENGTH, pickMarkdownIndex } from '../../web/markdown-index.js';
 
 const PUBLIC_BROWSER_CACHE = 'private, max-age=0, must-revalidate';
@@ -115,7 +115,10 @@ export async function serveFile(
   const dest = req.headers.get('sec-fetch-dest');
   const countView = (servedPath: string, bytes: number) => {
     if (opts.countView && !isHead && (!dest || dest === 'document' || dest === 'iframe')) {
-      ctx.waitUntil(env.DB.prepare('UPDATE artifacts SET view_count = view_count + 1 WHERE id = ?').bind(a.id).run().catch(() => {}));
+      // When Analytics Engine is configured, avoid D1 writes on every page load (counts come from WAE 90d queries).
+      if (!analyticsEnabled(env) && shouldCountView(req)) {
+        ctx.waitUntil(env.DB.prepare('UPDATE artifacts SET view_count = view_count + 1 WHERE id = ?').bind(a.id).run().catch(() => {}));
+      }
       recordView(env, ctx, req, a, servedPath, bytes);
     }
   };
