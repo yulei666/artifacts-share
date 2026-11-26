@@ -1,41 +1,28 @@
-// UI strings (zh / en). Language: saved choice → browser languages → Chinese.
+// Full UI strings (zh / en): registers admin-only strings on top of i18n-core.js.
+import { registerStrings } from './i18n-core.js';
 
-const DICT = {
+export const ADMIN_DICT = {
   zh: {
     'nav.artifacts': 'Artifacts',
     'nav.analytics': '统计',
     'nav.tokens': 'API 令牌',
     'nav.settings': '设置',
-    'nav.signOut': '退出登录',
-    'nav.menu': '菜单',
-    'lang.switch': 'EN',
-    'lang.switchFull': 'English',
-    'lang.switchTitle': 'Switch to English',
 
-    'common.copied': '已复制',
-    'common.copyFailed': '复制失败',
     'common.copy': '复制',
     'common.save': '保存',
     'common.saved': '已保存',
     'common.cancel': '取消',
     'common.never': '从未',
-    'common.untitled': '未命名',
     'common.loadMore': '加载更多',
-    'common.githubProject': 'GitHub 项目',
 
     'time.justNow': '刚刚',
     'time.minutes': '{n} 分钟前',
     'time.hours': '{n} 小时前',
     'time.days': '{n} 天前',
 
-    'vis.private': '私有',
-    'vis.public': '公开',
-    'vis.password': '访问码',
-
     'login.title': 'Artifacts Share',
     'login.password': '密码',
     'login.username': '用户名',
-    'login.captchaLoadFailed': '人机验证加载失败，请刷新页面重试',
     'login.submit': '登录',
     'login.continueWith': '使用 {name} 登录',
     'login.noMethods': '当前没有可用的登录方式。',
@@ -85,39 +72,11 @@ const DICT = {
 
     'new.title': '新建 artifact',
 
-    'viewer.copyLink': '复制链接',
-    'viewer.copyLinkCode': '复制链接 + 访问码',
-    'viewer.openRaw': '在新标签页中打开',
-    'viewer.manage': '管理',
-    'viewer.protected': '受访问码保护的内容',
-    'viewer.notFoundTitle': '未找到',
-    'viewer.notFoundDesc': '该内容不存在或无法访问。',
-    'viewer.ownerSignIn': '所有者登录',
-    'viewer.signIn': '登录',
-    'viewer.share': '分享',
-    'share.title': '分享',
-    'share.desc.private': '只有你可以查看',
-    'share.desc.public': '拿到链接的任何人都可以查看',
-    'share.desc.password': '拿到链接和访问码的人可以查看',
-    'share.code': '访问码',
-    'share.link': '链接',
-    'share.copyLinkOnly': '仅复制链接（不含访问码）',
-    'share.privateHint': '目前只有你能打开这个链接。',
-    'share.changed': '已改为「{v}」',
-    'viewer.download': '下载',
-    'dl.source': '下载源文件',
-    'dl.zip': '下载 ZIP',
-    'dl.sourceTitle': '下载源文件：{name}（{size}）',
-    'dl.zipTitle': '下载 ZIP：{name}（{n} 个文件，{size}）',
-    'dl.codeDesc': '输入访问码后即可下载。',
-    'dl.submit': '下载',
-    'dl.started': '开始下载',
     'settings.visitorDownload': '允许访客下载',
     'settings.visitorDownloadHint': '开启后，能查看 artifact 的访客也可以在分享页下载：单文件下载 HTML，多文件下载 ZIP。ZIP 包含全部文件，包括页面中没有链接到的文件。访问码模式需要输入访问码。',
 
     'detail.back': '← Artifacts',
     'detail.open': '打开 ↗',
-    'detail.linkCopied': '链接已复制',
     'detail.regenLink': '重新生成链接',
     'detail.regenLinkConfirm': '生成新链接后，旧链接会立即失效（返回 404）。确定继续吗？',
     'detail.regenLinkAlsoCode': '是否同时重新生成访问码？\n确定 = 同时更换访问码，取消 = 保留当前访问码',
@@ -131,17 +90,10 @@ const DICT = {
     'detail.kindHtml': 'HTML',
     'detail.kindMarkdown': 'Markdown',
     'detail.kindFolder': '文件夹',
-    'detail.access': '访问权限',
     'detail.help.private': '只有你（在本站登录后）可以打开，其他人会看到 404。',
     'detail.help.public': '任何拿到链接的人都可以查看。',
     'detail.help.password': '访客需要输入 6 位访问码。',
-    'detail.copyCode': '复制访问码',
-    'detail.codeCopied': '访问码已复制',
     'detail.copyLinkCode': '复制链接 + 访问码',
-    'detail.linkCodeCopied': '带访问码的链接已复制',
-    'detail.regenerate': '重新生成',
-    'detail.regenerateConfirm': '确定生成新的访问码吗？之前的访问码会立即失效。',
-    'detail.regenerated': '已生成新的访问码',
     'detail.options': '选项',
     'detail.indexable': '允许搜索引擎收录',
     'detail.indexableHint': '（仅公开时生效）',
@@ -273,8 +225,6 @@ const DICT = {
     'err.invalid_credentials': '用户名或密码不正确',
     'err.wrong_current_password': '当前密码不正确',
     'err.invalid_username': '用户名只能包含字母、数字和 . _ @ -，最长 64 个字符',
-    'err.turnstile_required': '请先完成人机验证',
-    'err.rate_limited': '尝试次数过多，请稍后再试',
     'err.password_login_disabled': '密码登录已关闭',
     'err.not_configured': '服务器未设置 ADMIN_BOOTSTRAP_PASSWORD',
     'err.weak_password': '密码长度需要在 8–200 个字符之间',
@@ -305,19 +255,10 @@ const DICT = {
     'err.duplicate_path': '存在重复的文件路径',
     'err.upload_not_found': '上传会话不存在或已过期',
     'err.version_not_found': '版本不存在',
-    'err.not_found': '内容不存在',
-    'err.unauthorized': '请先登录',
-    'err.csrf': '请求来源不合法',
-    'err.not_password_protected': '该 artifact 不是访问码模式',
-    'err.incorrect_code': '访问码不正确',
     'err.manifest_lost': '声明的文件清单不完整，请重新开始上传',
     'err.superseded': '已保存为历史版本，但已有更新的版本在线上，本次内容和设置没有生效',
     'err.sso_failed': '登录服务出错，请稍后重试',
     'err.upload_closed': '这次上传已经提交过了',
-    'err.incorrect_code_left': '访问码不正确，还可以再试 {n} 次',
-    'err.rate_limited_wait': '尝试次数过多，请在 {n} 分钟后重试',
-    'err.download_disabled': '此内容未开放下载',
-    'err.download_code_required': '请输入访问码后下载',
     'err.invalid_range': '时间范围参数不合法',
     'err.invalid_tz': '时区参数不合法',
     'err.invalid_bots': '爬虫筛选参数不合法',
@@ -331,36 +272,22 @@ const DICT = {
     'nav.analytics': 'Analytics',
     'nav.tokens': 'API tokens',
     'nav.settings': 'Settings',
-    'nav.signOut': 'Sign out',
-    'nav.menu': 'Menu',
-    'lang.switch': '中文',
-    'lang.switchFull': '中文',
-    'lang.switchTitle': '切换到中文',
 
-    'common.copied': 'Copied',
-    'common.copyFailed': 'Copy failed',
     'common.copy': 'Copy',
     'common.save': 'Save',
     'common.saved': 'Saved',
     'common.cancel': 'Cancel',
     'common.never': 'never',
-    'common.untitled': 'Untitled',
     'common.loadMore': 'Load more',
-    'common.githubProject': 'GitHub project',
 
     'time.justNow': 'just now',
     'time.minutes': '{n}m ago',
     'time.hours': '{n}h ago',
     'time.days': '{n}d ago',
 
-    'vis.private': 'Private',
-    'vis.public': 'Public',
-    'vis.password': 'Access code',
-
     'login.title': 'Artifacts Share',
     'login.password': 'Password',
     'login.username': 'Username',
-    'login.captchaLoadFailed': 'The verification failed to load. Refresh the page and try again.',
     'login.submit': 'Sign in',
     'login.continueWith': 'Continue with {name}',
     'login.noMethods': 'No sign-in method is available.',
@@ -410,39 +337,11 @@ const DICT = {
 
     'new.title': 'New artifact',
 
-    'viewer.copyLink': 'Copy link',
-    'viewer.copyLinkCode': 'Copy link + code',
-    'viewer.openRaw': 'Open in a new tab',
-    'viewer.manage': 'Manage',
-    'viewer.protected': 'Protected artifact',
-    'viewer.notFoundTitle': 'Not found',
-    'viewer.notFoundDesc': 'This artifact does not exist or is not available.',
-    'viewer.ownerSignIn': 'Owner sign-in',
-    'viewer.signIn': 'Sign in',
-    'viewer.share': 'Share',
-    'share.title': 'Share',
-    'share.desc.private': 'Only you can view',
-    'share.desc.public': 'Anyone with the link can view',
-    'share.desc.password': 'Anyone with the link and access code can view',
-    'share.code': 'Access code',
-    'share.link': 'Link',
-    'share.copyLinkOnly': 'Copy link without the code',
-    'share.privateHint': 'Only you can open this link right now.',
-    'share.changed': 'Changed to {v}',
-    'viewer.download': 'Download',
-    'dl.source': 'Download source file',
-    'dl.zip': 'Download ZIP',
-    'dl.sourceTitle': 'Download source file: {name} ({size})',
-    'dl.zipTitle': 'Download ZIP: {name} ({n} files, {size})',
-    'dl.codeDesc': 'Enter the access code to download.',
-    'dl.submit': 'Download',
-    'dl.started': 'Download started',
     'settings.visitorDownload': 'Allow visitors to download',
     'settings.visitorDownloadHint': 'Visitors who can view an artifact can also download it from the share page: the HTML file for single-file artifacts, a ZIP for multi-file ones. The ZIP contains every file, including ones no page links to. Access-code artifacts require the code.',
 
     'detail.back': '← Artifacts',
     'detail.open': 'Open ↗',
-    'detail.linkCopied': 'Link copied',
     'detail.regenLink': 'Regenerate link',
     'detail.regenLinkConfirm': 'Generate a new link? The current link stops working immediately (404).',
     'detail.regenLinkAlsoCode': 'Also regenerate the access code?\nOK = new code, Cancel = keep the current code',
@@ -456,17 +355,10 @@ const DICT = {
     'detail.kindHtml': 'HTML',
     'detail.kindMarkdown': 'Markdown',
     'detail.kindFolder': 'Folder',
-    'detail.access': 'Access',
     'detail.help.private': 'Only you can open it (after signing in here). Visitors get a 404.',
     'detail.help.public': 'Anyone with the link can view it.',
     'detail.help.password': 'Visitors need the 6-character access code.',
-    'detail.copyCode': 'Copy code',
-    'detail.codeCopied': 'Code copied',
     'detail.copyLinkCode': 'Copy link + code',
-    'detail.linkCodeCopied': 'Link with code copied',
-    'detail.regenerate': 'Regenerate',
-    'detail.regenerateConfirm': 'Generate a new code? The current code stops working immediately.',
-    'detail.regenerated': 'New code generated',
     'detail.options': 'Options',
     'detail.indexable': 'Allow search engines to index',
     'detail.indexableHint': '(public only)',
@@ -598,8 +490,6 @@ const DICT = {
     'err.invalid_credentials': 'Incorrect username or password',
     'err.wrong_current_password': 'Current password is incorrect',
     'err.invalid_username': 'Username: up to 64 letters, digits or . _ @ -',
-    'err.turnstile_required': 'Complete the verification first',
-    'err.rate_limited': 'Too many attempts, try again later',
     'err.password_login_disabled': 'Password sign-in is disabled',
     'err.not_configured': 'ADMIN_BOOTSTRAP_PASSWORD is not set on the server',
     'err.weak_password': 'Password must be 8–200 characters',
@@ -630,19 +520,10 @@ const DICT = {
     'err.duplicate_path': 'Duplicate file paths',
     'err.upload_not_found': 'Upload session not found or expired',
     'err.version_not_found': 'Version not found',
-    'err.not_found': 'Not found',
-    'err.unauthorized': 'Please sign in',
-    'err.csrf': 'Request origin rejected',
-    'err.not_password_protected': 'This artifact is not in access-code mode',
-    'err.incorrect_code': 'Incorrect access code',
     'err.manifest_lost': 'The declared file list is incomplete; start the upload again',
     'err.superseded': 'Saved as an older version, but a newer version is live; this upload and its settings did not take effect',
     'err.sso_failed': 'The sign-in provider failed, try again later',
     'err.upload_closed': 'This upload was already committed',
-    'err.incorrect_code_left': 'Incorrect access code. {n} attempt(s) left',
-    'err.rate_limited_wait': 'Too many attempts. Try again in {n} minute(s)',
-    'err.download_disabled': 'Downloads are not available for this artifact',
-    'err.download_code_required': 'Enter the access code to download',
     'err.invalid_range': 'Invalid time range',
     'err.invalid_tz': 'Invalid timezone offset',
     'err.invalid_bots': 'Invalid bots filter',
@@ -652,52 +533,8 @@ const DICT = {
   },
 };
 
-// Errors whose server message carries useful specifics (file names, limits).
-const DETAILED = new Set(['too_many_files', 'file_too_large', 'missing_files', 'invalid_path', 'invalid_entry', 'zip_too_large', 'zip_too_many_files', 'invalid_zip']);
+const ADMIN_DETAILED = ['too_many_files', 'file_too_large', 'missing_files', 'invalid_path', 'invalid_entry', 'zip_too_large', 'zip_too_many_files', 'invalid_zip'];
 
-const STORAGE_KEY = 'artifacts-share.lang';
+registerStrings(ADMIN_DICT, ADMIN_DETAILED);
 
-function detect() {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved === 'zh' || saved === 'en') return saved;
-  } catch {
-    /* storage unavailable */
-  }
-  for (const l of navigator.languages || [navigator.language]) {
-    const base = String(l).toLowerCase().split('-')[0];
-    if (base === 'zh' || base === 'en') return base;
-  }
-  return 'zh';
-}
-
-export let lang = detect();
-document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
-
-export function setLang(l) {
-  lang = l;
-  document.documentElement.lang = l === 'zh' ? 'zh-CN' : 'en';
-  try {
-    localStorage.setItem(STORAGE_KEY, l);
-  } catch {
-    /* ignore */
-  }
-}
-
-export function t(key, params) {
-  let s = DICT[lang][key] ?? DICT.en[key] ?? key;
-  if (params) s = s.replace(/\{(\w+)\}/g, (m, k) => (k in params ? String(params[k]) : m));
-  return s;
-}
-
-/** Translates an API error code (using structured details when present); falls back to the server message. */
-export function errorText(code, message, details) {
-  if (code === 'rate_limited' && typeof details?.retry_after === 'number') return t('err.rate_limited_wait', { n: Math.max(1, Math.ceil(details.retry_after / 60)) });
-  if (code === 'incorrect_code' && typeof details?.remaining === 'number') return t('err.incorrect_code_left', { n: details.remaining });
-  const key = `err.${code}`;
-  if (!code || !(key in DICT[lang])) return message || code || 'Error';
-  if (DETAILED.has(code) && message) return lang === 'zh' ? `${t(key)}（${message}）` : `${t(key)} (${message})`;
-  return t(key);
-}
-
-export const locale = () => (lang === 'zh' ? 'zh-CN' : 'en-US');
+export { CORE_DICT, DICT, errorText, lang, locale, registerStrings, setLang, t } from './i18n-core.js';

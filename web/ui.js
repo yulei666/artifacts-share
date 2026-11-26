@@ -1,5 +1,5 @@
 // DOM and API helpers shared by the admin SPA (app.js) and the share viewer (viewer.js).
-import { errorText, lang, setLang, t } from './i18n.js';
+import { errorText, lang, setLang, t } from './i18n-core.js';
 
 /** Artifact access modes, in display order (labels: `vis.<mode>`). */
 export const VISIBILITIES = ['private', 'public', 'password'];

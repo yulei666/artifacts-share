@@ -1,4 +1,12 @@
-import { MARKDOWN_PREVIEW_MAX_BYTES, MARKDOWN_RAW_PARAM, markdownEtag, markdownObjectEtag, markdownPage } from './markdown';
+import {
+  MARKDOWN_PREVIEW_MAX_BYTES,
+  MARKDOWN_RAW_PARAM,
+  markdownEtag,
+  markdownObjectEtag,
+  markdownPage,
+  readerShellHash,
+  resolveMarkdownAssets,
+} from './markdown';
 import type { PageCtx } from './pages';
 import type { ArtifactRow, Env } from '../env';
 import { contentTypeFor, isHtmlPath, isMarkdownPath } from '../lib/mime';
@@ -10,6 +18,7 @@ import { MARKDOWN_INDEX_MAX_LENGTH, pickMarkdownIndex } from '../../web/markdown
 
 const PUBLIC_BROWSER_CACHE = 'private, max-age=0, must-revalidate';
 const EDGE_CACHE_MAX_BYTES = 5 * 1024 * 1024;
+const SOURCE_BYTES_HEADER = 'x-as-source-bytes';
 
 function baseHeaders(a: ArtifactRow, isPublic: boolean, ancestors: string): Headers {
   const h = new Headers({
@@ -41,9 +50,10 @@ function rangeHeader(range: R2Range, size: number): string {
 }
 
 function matchesEtag(value: string, etag: string | null, weak = false): boolean {
+  const target = weak && etag ? etag.replace(/^W\//, '') : etag;
   return value.trim() === '*' || value.split(',').some((tag) => {
     const trimmed = tag.trim();
-    return (weak ? trimmed.replace(/^W\//, '') : trimmed) === etag;
+    return (weak ? trimmed.replace(/^W\//, '') : trimmed) === target;
   });
 }
 
@@ -127,48 +137,84 @@ export async function serveFile(
   // renders). Everything else — curl, scripts, agents, fetch() — gets the raw file: without Sec-Fetch-Dest
   // (older browsers, non-browser clients) only an Accept that asks for HTML counts as a page load.
   const pageLoad = dest === 'document' || dest === 'iframe' || (!dest && prefersHtml(req.headers.get('accept')));
+  const conditional = ['if-match', 'if-unmodified-since', 'if-range'].some((name) => req.headers.has(name))
+    || (req.headers.has('if-modified-since') && !req.headers.has('if-none-match'));
+  const cacheable = isPublic && req.method === 'GET' && !req.headers.has('range') && !conditional;
+  const encodePath = (file: string) => file.split('/').map(encodeURIComponent).join('/');
+  const fileCacheKey = (file: string, isMd: boolean) =>
+    new Request(`${url.origin}/__cache/v${version}/i${a.indexable}${isMd ? (plainMarkdown ? '-markdown-plain' : '-markdown') : ''}/${encodePath(file)}`);
+  const serveCacheHit = async (
+    hit: Response,
+    servedPath: string,
+    hitOpts: { isMarkdownReader?: boolean; isMarkdownRaw?: boolean } = {},
+  ): Promise<Response> => {
+    const headers = new Headers(hit.headers);
+    const sourceBytes = hitOpts.isMarkdownReader
+      ? (Number(headers.get(SOURCE_BYTES_HEADER) ?? 0) || 0)
+      : (Number(headers.get('content-length') ?? 0) || 0);
+    headers.delete(SOURCE_BYTES_HEADER);
+    headers.set('cache-control', PUBLIC_BROWSER_CACHE);
+    if (hitOpts.isMarkdownReader || hitOpts.isMarkdownRaw) {
+      headers.set('vary', 'sec-fetch-dest, accept');
+    }
+    const inm = req.headers.get('if-none-match');
+    if (inm && matchesEtag(inm, headers.get('etag'), true)) {
+      await hit.body?.cancel();
+      return new Response(null, { status: 304, headers });
+    }
+    if (hitOpts.isMarkdownReader || isHtmlPath(servedPath)) countView(servedPath, sourceBytes);
+    return new Response(hit.body, { status: hit.status, headers });
+  };
+
   // A reader response carries its source from the same authorized version snapshot.
   if (markdown && rawMarkdown === null && pageLoad && !req.headers.has('range')) {
+    const assets = await resolveMarkdownAssets(env);
+    const readerCacheKey = new Request(
+      `${url.origin}/__cache/md-reader/v${version}/i${a.indexable}/${opts.lang}/${readerShellHash(assets)}/${encodePath(path)}`,
+    );
+    if (cacheable) {
+      const hit = await caches.default.match(readerCacheKey);
+      if (hit) return serveCacheHit(hit, path, { isMarkdownReader: true });
+    }
     const objectKey = r2Key(a.id, version, path);
     // A reader validator from this shell and language names the object ETag it was built from; R2 checks it in
     // the same GET (no body when it still matches), so a revalidation costs one operation either way.
-    const known = markdownObjectEtag(req.headers.get('if-none-match'), opts.lang);
+    const known = markdownObjectEtag(req.headers.get('if-none-match'), opts.lang, assets);
     const object = isHead
       ? await env.BUCKET.head(objectKey)
       : await env.BUCKET.get(objectKey, known ? { onlyIf: { etagDoesNotMatch: known } } : undefined);
     if (object) {
-      const etag = markdownEtag(object.httpEtag, opts.lang);
+      const etag = markdownEtag(object.httpEtag, opts.lang, assets);
       const headers = baseHeaders(a, isPublic, ancestors);
       const body = 'body' in object ? object as R2ObjectBody : null;
-      if (known && object.etag === known && (isHead || !body)) return markdownPage(req, opts, headers, null, etag, true);
+      if (known && object.etag === known && (isHead || !body)) return markdownPage(req, opts, headers, null, etag, true, assets);
       let source: string | null = null;
       if (body) {
         if (body.size <= MARKDOWN_PREVIEW_MAX_BYTES) source = await body.text();
         else await body.body.cancel();
       }
-      countView(path, body?.size ?? 0);
-      return markdownPage(req, opts, headers, source, etag);
+      const sourceBytes = body?.size ?? 0;
+      countView(path, sourceBytes);
+      const res = markdownPage(req, opts, headers, source, etag, false, assets);
+      const htmlBytes = Number(res.headers.get('content-length') ?? 0);
+      if (cacheable && res.status === 200 && source !== null && htmlBytes <= EDGE_CACHE_MAX_BYTES) {
+        const cached = res.clone();
+        const cacheHeaders = new Headers(cached.headers);
+        // Cloudflare caches.default does not reliably cache responses with non-Accept-Encoding Vary headers.
+        cacheHeaders.delete('vary');
+        cacheHeaders.set(SOURCE_BYTES_HEADER, String(sourceBytes));
+        cacheHeaders.set('cache-control', 'public, max-age=86400');
+        ctx.waitUntil(caches.default.put(readerCacheKey, new Response(cached.body, { headers: cacheHeaders })));
+      }
+      return res;
     }
   }
 
-  const conditional = ['if-match', 'if-unmodified-since', 'if-modified-since', 'if-range'].some((name) => req.headers.has(name));
-  const cacheable = isPublic && req.method === 'GET' && !req.headers.has('range') && !conditional;
   // `indexable` changes response headers, so it is part of the key.
-  const cacheKey = new Request(`${url.origin}/__cache/v${version}/i${a.indexable}${markdown ? (plainMarkdown ? '-markdown-plain' : '-markdown') : ''}/${path.split('/').map(encodeURIComponent).join('/')}`);
+  const cacheKey = fileCacheKey(path, markdown);
   if (cacheable) {
     const hit = await caches.default.match(cacheKey);
-    if (hit) {
-      const inm = req.headers.get('if-none-match');
-      const headers = new Headers(hit.headers);
-      headers.set('cache-control', PUBLIC_BROWSER_CACHE);
-      const etag = headers.get('etag');
-      if (inm && matchesEtag(inm, etag, true)) {
-        await hit.body?.cancel();
-        return new Response(null, { status: 304, headers });
-      }
-      if (isHtmlPath(path)) countView(path, Number(headers.get('content-length') ?? 0) || 0);
-      return new Response(hit.body, { status: hit.status, headers });
-    }
+    if (hit) return serveCacheHit(hit, path, { isMarkdownRaw: markdown });
   }
 
   let rangeApplied = false;
@@ -196,6 +242,7 @@ export async function serveFile(
   }
   let status = 200;
   let servedPath = path;
+  let targetCacheKey: Request | null = cacheKey;
 
   if (!obj) {
     if (!trailing && key !== '' && (await env.BUCKET.head(r2Key(a.id, version, `${key}/index.html`)))) {
@@ -229,12 +276,19 @@ export async function serveFile(
         const entry = '/' + a.entry.split('/').map(encodeURIComponent).join('/');
         return new Response(null, { status: 302, headers: { location: entry + url.search, 'cache-control': 'no-store' } });
       }
+      const entryCacheKey = fileCacheKey(a.entry, false);
+      if (cacheable && path !== a.entry) {
+        const hit = await caches.default.match(entryCacheKey);
+        if (hit) return serveCacheHit(hit, a.entry);
+      }
       obj = await load(a.entry, true);
       servedPath = a.entry;
+      targetCacheKey = entryCacheKey;
     } else {
       obj = await load('404.html', false);
       servedPath = '404.html';
       status = 404;
+      targetCacheKey = null;
     }
     if (!obj) return plain(404, 'Not found', a, ancestors);
   }
@@ -270,11 +324,13 @@ export async function serveFile(
   const res = new Response((obj as R2ObjectBody).body, { status, headers });
   // Only small files go to the edge cache: clone() tees the body, and for a big file sent to a slow client the
   // runtime would buffer the difference in memory (128 MB isolate).
-  if (cacheable && status === 200 && servedPath === path && obj.size <= EDGE_CACHE_MAX_BYTES) {
+  if (cacheable && status === 200 && targetCacheKey && obj.size <= EDGE_CACHE_MAX_BYTES) {
     const cached = res.clone();
     const cacheHeaders = new Headers(cached.headers);
+    if (isMarkdownPath(servedPath)) cacheHeaders.delete('vary');
+    if (!cacheHeaders.has('content-length')) cacheHeaders.set('content-length', String(obj.size));
     cacheHeaders.set('cache-control', 'public, max-age=86400');
-    ctx.waitUntil(caches.default.put(cacheKey, new Response(cached.body, { headers: cacheHeaders })));
+    ctx.waitUntil(caches.default.put(targetCacheKey, new Response(cached.body, { headers: cacheHeaders })));
   }
   return res;
 }

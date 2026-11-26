@@ -462,11 +462,35 @@ async function readDropped(dataTransfer) {
 }
 
 async function expandZip(file) {
-  const { unzipSync } = await import('/vendor/fflate.js');
-  const data = unzipSync(new Uint8Array(await file.arrayBuffer()));
-  return Object.entries(data)
-    .filter(([name]) => !name.endsWith('/'))
-    .map(([path, bytes]) => ({ path, blob: new Blob([bytes]) }));
+  const buffer = await file.arrayBuffer();
+  if (typeof Worker === 'undefined') {
+    const { unzipSync } = await import('/vendor/fflate.js');
+    const data = unzipSync(new Uint8Array(buffer));
+    return Object.entries(data)
+      .filter(([name]) => !name.endsWith('/'))
+      .map(([path, bytes]) => ({ path, blob: new Blob([bytes]) }));
+  }
+  const worker = new Worker('/zip-worker.js', { type: 'module' });
+  try {
+    const files = await new Promise((resolve, reject) => {
+      worker.onmessage = (event) => {
+        const res = event.data;
+        if (res?.ok) resolve(res.files);
+        else reject(new Error(res?.message || 'Failed to extract zip'));
+      };
+      worker.onerror = (event) => {
+        event.preventDefault?.();
+        reject(new Error(event?.message || 'Failed to extract zip'));
+      };
+      worker.onmessageerror = () => {
+        reject(new Error('Failed to extract zip'));
+      };
+      worker.postMessage({ buffer }, [buffer]);
+    });
+    return files.map((f) => ({ path: f.path, blob: new Blob([new Uint8Array(f.buffer, f.byteOffset, f.byteLength)]) }));
+  } finally {
+    worker.terminate();
+  }
 }
 
 function normalizeFiles(files) {

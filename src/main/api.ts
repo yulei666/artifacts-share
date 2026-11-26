@@ -178,8 +178,8 @@ api.get('/artifacts', async (c) => {
       throw new HttpError(400, 'invalid_cursor', 'Invalid cursor');
     }
     if (!/^\d+$/.test(u ?? '') || !id) throw new HttpError(400, 'invalid_cursor', 'Invalid cursor');
-    where.push('(a.updated_at < ? OR (a.updated_at = ? AND a.id < ?))');
-    binds.push(Number(u), Number(u), id);
+    where.push('(a.updated_at, a.id) < (?, ?)');
+    binds.push(Number(u), id);
   }
   const { results } = await c.env.DB.prepare(
     `SELECT a.*, v.file_count, v.total_size FROM artifacts a

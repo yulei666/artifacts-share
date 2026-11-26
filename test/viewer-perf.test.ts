@@ -187,7 +187,7 @@ describe('share viewer /s/:pid inline init and preconnect', () => {
 
     const html = await res.text();
     expect(html).toContain('<link rel="modulepreload" href="/ui.js">');
-    expect(html).toContain('<link rel="modulepreload" href="/i18n.js">');
+    expect(html).toContain('<link rel="modulepreload" href="/i18n-core.js">');
 
     const init = extractViewerInit(html);
     expect(init).not.toBeNull();
