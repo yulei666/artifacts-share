@@ -692,6 +692,59 @@ export interface IncomingFile {
   size?: number;
 }
 
+async function insertUploadFiles(
+  env: Env,
+  upload: UploadRow,
+  files: { path: string; size: number; content_type: string }[],
+): Promise<void> {
+  const CHUNK_BYTES = 512 * 1024;
+  const utf8 = new TextEncoder();
+  const t = now();
+  const stmts: D1PreparedStatement[] = [];
+  let part: [string, number, string][] = [];
+  let bytes = 2; // '[]'
+  const flush = () => {
+    if (!part.length) return;
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO artifact_files (artifact_id, version, path, size, content_type)
+         SELECT ?1, ?2, json_extract(j.value, '$[0]'), json_extract(j.value, '$[1]'), json_extract(j.value, '$[2]')
+         FROM json_each(?5) j
+         WHERE EXISTS (SELECT 1 FROM uploads WHERE id = ?3 AND expires_at > ?4)`,
+      ).bind(upload.artifact_id, upload.version, upload.id, t, JSON.stringify(part)),
+    );
+    part = [];
+    bytes = 2;
+  };
+  for (const f of files) {
+    const tuple: [string, number, string] = [f.path, f.size, f.content_type];
+    const entryBytes = utf8.encode(JSON.stringify(tuple)).byteLength + 1;
+    if (part.length && bytes + entryBytes > CHUNK_BYTES) flush();
+    part.push(tuple);
+    bytes += entryBytes;
+  }
+  flush();
+  const insertCount = stmts.length;
+  stmts.push(
+    env.DB.prepare('UPDATE uploads SET revision = revision + 1, file_count = ?2 WHERE id = ?1 AND expires_at > ?3')
+      .bind(upload.id, files.length, t),
+  );
+
+  let inserted = 0;
+  let updatedUpload = 0;
+  for (let i = 0; i < stmts.length; i += 50) {
+    const batchResults = await env.DB.batch(stmts.slice(i, i + 50));
+    for (let j = 0; j < batchResults.length; j++) {
+      const idx = i + j;
+      if (idx < insertCount) inserted += batchResults[j].meta.changes;
+      else updatedUpload += batchResults[j].meta.changes;
+    }
+  }
+  if (inserted !== files.length || updatedUpload !== 1) {
+    throw await goneError(env, upload);
+  }
+}
+
 /** One-shot upload used by the direct POST/PUT endpoints (raw HTML, multipart, zip). */
 export async function uploadFiles(
   env: Env,
@@ -708,34 +761,71 @@ export async function uploadFiles(
   });
   const { strip, paths } = stripCommonRoot(normalized);
   if (new Set(paths).size !== paths.length) throw new HttpError(400, 'duplicate_path', 'Duplicate file paths');
+  const utf8 = new TextEncoder();
+  const prepared = paths.map((rawPath, idx) => {
+    const path = normalizePath(rawPath);
+    if (!path) throw new HttpError(400, 'invalid_path', `Invalid path: ${rawPath}`);
+    const body = kept[idx].body;
+    const size = typeof body === 'string' ? utf8.encode(body).byteLength
+      : body instanceof Blob ? body.size
+      : body instanceof ReadableStream ? kept[idx].size
+      : body.byteLength;
+    if (size == null || !Number.isSafeInteger(size) || size < 0) throw new HttpError(400, 'invalid_size', 'File size is required');
+    if (size > opts.settings.max_file_bytes) throw new HttpError(413, 'file_too_large', `${path} exceeds ${opts.settings.max_file_bytes} bytes`);
+    return { path, body, size, contentType: contentTypeFor(path) };
+  });
   const meta = { ...opts.meta };
   if (strip && meta.entry?.startsWith(strip)) meta.entry = meta.entry.slice(strip.length);
 
   const upload = await beginUpload(env, { artifactId: opts.artifactId, meta, createdBy: opts.createdBy });
-  let i = 0;
-  let failed = false;
-  const worker = async () => {
-    while (!failed && i < kept.length) {
-      const idx = i++;
-      try {
-        await putUploadFile(env, upload, paths[idx], kept[idx].body, opts.settings, kept[idx].size);
-      } catch (e) {
-        failed = true;
-        throw e;
-      }
-    }
-  };
-  // allSettled: on failure, wait for in-flight writes to finish before aborting so none outlive the abort.
-  const results = await Promise.allSettled(Array.from({ length: Math.min(6, kept.length) }, worker));
-  const err = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
   try {
+    const uploaded: { path: string; size: number; content_type: string }[] = new Array(prepared.length);
+    let i = 0;
+    let failed = false;
+    const worker = async () => {
+      while (!failed && i < prepared.length) {
+        const idx = i++;
+        const f = prepared[idx];
+        try {
+          const obj = await env.BUCKET.put(r2Key(upload.artifact_id, upload.version, f.path), f.body, {
+            httpMetadata: { contentType: f.contentType },
+          });
+          if (!obj) throw new HttpError(500, 'storage_error', 'Failed to store file');
+          if (obj.size !== f.size) throw new HttpError(400, 'invalid_size', 'Stored file size differs from the request size');
+          uploaded[idx] = { path: f.path, size: obj.size, content_type: f.contentType };
+        } catch (e) {
+          failed = true;
+          throw e;
+        }
+      }
+    };
+    // allSettled: on failure, wait for in-flight writes to finish before aborting so none outlive the abort.
+    const results = await Promise.allSettled(Array.from({ length: Math.min(6, prepared.length) }, worker));
+    const err = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
     if (err) throw err.reason;
+    await insertUploadFiles(env, upload, uploaded);
     return await commitUpload(env, upload, opts.settings);
   } catch (e) {
-    // commitUpload deletes the upload row in the same batch that publishes the version. If the row is
-    // gone, the version is live and the error came afterwards — aborting would delete live content.
-    const pending = await env.DB.prepare('SELECT 1 FROM uploads WHERE id = ?').bind(upload.id).first().catch(() => true);
-    if (pending) await abortUpload(env, upload).catch(() => {});
+    // Only skip cleanup if this version actually reached COMMITTED_STATES. If the upload row was deleted
+    // concurrently (e.g. by purgeArtifact), abortUpload returns early, so also purge this version's R2 prefix
+    // unconditionally whenever the version is not committed.
+    let committed = true;
+    try {
+      committed = Boolean(
+        await env.DB.prepare(
+          `SELECT 1 FROM artifact_versions WHERE artifact_id = ? AND version = ? AND status IN (${COMMITTED_STATES})`,
+        )
+          .bind(upload.artifact_id, upload.version)
+          .first(),
+      );
+    } catch {
+      await abortUpload(env, upload).catch(() => {});
+      throw e;
+    }
+    if (!committed) {
+      await abortUpload(env, upload).catch(() => {});
+      await purgeVersionFiles(env, upload.artifact_id, upload.version).catch(() => {});
+    }
     throw e;
   }
 }

@@ -1,32 +1,11 @@
 import MarkdownIt from 'markdown-it';
 import GithubSlugger from 'github-slugger';
-import hljs from 'highlight.js/lib/core';
-import bash from 'highlight.js/lib/languages/bash';
-import css from 'highlight.js/lib/languages/css';
-import go from 'highlight.js/lib/languages/go';
-import javascript from 'highlight.js/lib/languages/javascript';
-import json from 'highlight.js/lib/languages/json';
-import markdown from 'highlight.js/lib/languages/markdown';
-import python from 'highlight.js/lib/languages/python';
-import sql from 'highlight.js/lib/languages/sql';
-import typescript from 'highlight.js/lib/languages/typescript';
-import xml from 'highlight.js/lib/languages/xml';
-import yaml from 'highlight.js/lib/languages/yaml';
 import './markdown-preview.css';
 
 const MAX_RENDERED_DIAGRAMS = 20;
+const MAX_HIGHLIGHT_CHARS = 64 * 1024;
 
-for (const [name, language] of Object.entries({ bash, css, go, javascript, json, markdown, python, sql, typescript, xml, yaml })) {
-  hljs.registerLanguage(name, language);
-}
-
-const parser = new MarkdownIt({
-  html: false,
-  highlight(code, lang) {
-    if (code.length > 64 * 1024 || lang.toLowerCase() === 'mermaid' || !hljs.getLanguage(lang)) return '';
-    return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
-  },
-});
+const parser = new MarkdownIt({ html: false });
 
 const article = document.getElementById('reader:preview');
 const source = document.getElementById('reader:source');
@@ -138,6 +117,19 @@ function addCopyButtons() {
   }
 }
 
+async function highlightCode() {
+  const blocks = [];
+  for (const code of article.querySelectorAll('pre > code[class*="language-"]')) {
+    const lang = [...code.classList].find((name) => name.startsWith('language-'))?.slice('language-'.length);
+    if (!lang || lang.toLowerCase() === 'mermaid') continue;
+    if ((code.textContent ?? '').length > MAX_HIGHLIGHT_CHARS) continue;
+    blocks.push({ code, lang });
+  }
+  if (!blocks.length) return;
+  const { highlightBlocks } = await import('./markdown-highlight.js');
+  highlightBlocks(blocks);
+}
+
 async function renderDiagrams() {
   const diagrams = article.querySelectorAll('pre > code.language-mermaid');
   if (!diagrams.length) return;
@@ -180,6 +172,7 @@ try {
     // The heading did not exist when the browser first processed the fragment.
     try { document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView(); } catch {}
   }
+  void highlightCode().catch(() => {});
   void renderDiagrams().catch(() => {});
 } catch {
   status.textContent = status.dataset.error;

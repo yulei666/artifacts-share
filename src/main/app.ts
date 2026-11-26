@@ -541,8 +541,16 @@ app.get('/handoff', async (c) => {
 
 // ---------- admin SPA ----------
 
+const STATIC_ASSET_RE = /\.(?:js|css|svg)$/i;
+const STATIC_ASSET_CACHE = 'public, max-age=300, stale-while-revalidate=86400';
+
 app.all('*', async (c) => {
   if (c.req.method !== 'GET' && c.req.method !== 'HEAD') return c.text('Method not allowed', 405);
   const res = await c.env.ASSETS.fetch(c.req.raw);
-  return new Response(res.body, res);
+  const out = new Response(res.body, res);
+  const contentType = (out.headers.get('content-type') ?? '').split(';', 1)[0].trim().toLowerCase();
+  if (out.status === 200 && STATIC_ASSET_RE.test(c.req.path) && contentType !== 'text/html') {
+    out.headers.set('cache-control', STATIC_ASSET_CACHE);
+  }
+  return out;
 });

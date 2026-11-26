@@ -26,6 +26,34 @@ export async function sweepOrphanManifests(env: Env, batch = 5_000, maxBatches =
   return deleted;
 }
 
+const CLEANUP_CONCURRENCY = 4;
+
+/**
+ * Runs `fn` over `rows` with bounded concurrency (`limit`). Each row is isolated: one failure is logged
+ * and skipped without stopping sibling or remaining rows.
+ */
+export async function eachRow<T>(
+  name: string,
+  rows: T[],
+  fn: (row: T) => Promise<void>,
+  limit = CLEANUP_CONCURRENCY,
+): Promise<void> {
+  if (!rows.length) return;
+  const workers = Math.min(Math.max(1, Math.floor(limit)), rows.length);
+  let next = 0;
+  const run = async () => {
+    while (next < rows.length) {
+      const row = rows[next++];
+      try {
+        await fn(row);
+      } catch (e) {
+        console.error(`cleanup "${name}" failed for`, row, e);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: workers }, run));
+}
+
 /**
  * Daily cleanup: stale uploads, deleted artifacts, surplus versions, expired auth state.
  * Every step — and every row within a step — is isolated: one failure is logged and skipped, it doesn't
@@ -39,15 +67,6 @@ export async function runCleanup(env: Env): Promise<void> {
       await fn();
     } catch (e) {
       console.error(`cleanup step "${name}" failed`, e);
-    }
-  };
-  const eachRow = async <T>(name: string, rows: T[], fn: (row: T) => Promise<void>) => {
-    for (const row of rows) {
-      try {
-        await fn(row);
-      } catch (e) {
-        console.error(`cleanup "${name}" failed for`, row, e);
-      }
     }
   };
 
@@ -102,9 +121,15 @@ export async function runCleanup(env: Env): Promise<void> {
   await step('surplus versions', async () => {
     const { keep_versions } = await getSettings(env, { fresh: true });
     const { results } = await env.DB.prepare(
-      `SELECT v.artifact_id, v.version FROM artifact_versions v JOIN artifacts a ON a.id = v.artifact_id
-       WHERE v.status = 'ready' AND v.version != a.current_version
-         AND (SELECT COUNT(*) FROM artifact_versions v2 WHERE v2.artifact_id = v.artifact_id AND v2.status = 'ready' AND v2.version > v.version) >= ?
+      `WITH ranked AS (
+         SELECT v.artifact_id, v.version, a.current_version,
+                ROW_NUMBER() OVER (PARTITION BY v.artifact_id ORDER BY v.version DESC) AS rn
+         FROM artifact_versions v
+         JOIN artifacts a ON a.id = v.artifact_id
+         WHERE v.status = 'ready'
+       )
+       SELECT artifact_id, version FROM ranked
+       WHERE rn > ? AND version != current_version
        ORDER BY RANDOM() LIMIT 200`,
     )
       .bind(keep_versions)

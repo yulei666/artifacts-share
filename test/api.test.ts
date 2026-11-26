@@ -2497,7 +2497,9 @@ describe('Markdown shares', () => {
     const preview = await page(a.content_url);
     expect(preview.headers.get('content-type')).toContain('text/html');
     expect(preview.headers.get('content-security-policy')).toContain("default-src 'none'");
-    expect(await preview.text()).toContain('/__share/markdown/preview.js');
+    const previewHtml = await preview.text();
+    expect(previewHtml).toMatch(/\/__share\/markdown\/preview-[A-Za-z0-9_-]+\.js/);
+    expect(previewHtml).toMatch(/\/__share\/markdown\/preview-[A-Za-z0-9_-]+\.css/);
 
     const raw = await fetchRaw(`${a.content_url}?__share_raw=1`);
     expect(raw.headers.get('content-type')).toContain('text/markdown');

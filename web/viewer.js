@@ -1,5 +1,5 @@
 // Share viewer: top bar + sandboxed iframe of the artifact's own subdomain (like Claude artifacts).
-import { lang, setLang, t } from './i18n.js';
+import { lang, setLang, t } from './i18n-core.js';
 import { act, brandLogo, copy, fmtBytes, githubProjectLink, h, mountTurnstile, request, toast, VISIBILITIES } from './ui.js';
 
 const $bar = document.getElementById('vbar');
