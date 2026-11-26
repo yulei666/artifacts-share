@@ -456,6 +456,49 @@ describe('listing and deletion', () => {
     expect(gone.status).toBe(404);
     await gone.arrayBuffer();
   });
+
+  it('matches multiple whitespace-separated keywords with AND semantics (including Chinese)', async () => {
+    const both = await createHtml('<p>1</p>', `?visibility=public&title=${encodeURIComponent('系统架构说明 · Q4 复盘')}`);
+    const onlyArch = await createHtml('<p>2</p>', `?visibility=public&title=${encodeURIComponent('系统架构总览')}`);
+    const special = await createHtml('<p>3</p>', `?visibility=private&title=${encodeURIComponent('100%_完成\\归档')}`);
+    // Negative control: would match `%100%_%` + `%\归档%` if LIKE wildcards or backslash were not escaped.
+    const wildcardTrap = await createHtml('<p>4</p>', `?visibility=private&title=${encodeURIComponent('100xy归档')}`);
+
+    // Out-of-order Chinese terms, full-width space, and duplicate ASCII/Chinese terms all match `both` and exclude `onlyArch`.
+    for (const q of ['架构 复盘', '复盘   架构', '架构\u3000复盘', 'Q4 q4 架构 架构 复盘']) {
+      const res = await json(await api(`/api/v1/artifacts?q=${encodeURIComponent(q)}`), 200);
+      const ids = res.items.map((i: any) => i.id);
+      expect(ids).toContain(both.id);
+      expect(ids).not.toContain(onlyArch.id);
+    }
+
+    // Whitespace-only query acts as no filter.
+    const blank = await json(await api(`/api/v1/artifacts?q=${encodeURIComponent('  \u3000 ')}`), 200);
+    expect(blank.items.map((i: any) => i.id)).toEqual(expect.arrayContaining([both.id, onlyArch.id]));
+
+    // Mixes a title keyword with an artifact id prefix.
+    const byTitleAndId = await json(await api(`/api/v1/artifacts?q=${encodeURIComponent(`架构 ${onlyArch.id.slice(0, 8)}`)}`), 200);
+    expect(byTitleAndId.items.map((i: any) => i.id)).toEqual([onlyArch.id]);
+
+    // Escapes SQL LIKE wildcards across multiple terms (negative control `100xy归档` must NOT match).
+    const escaped = await json(await api(`/api/v1/artifacts?q=${encodeURIComponent('100%_ \\归档')}`), 200);
+    const escapedIds = escaped.items.map((i: any) => i.id);
+    expect(escapedIds).toContain(special.id);
+    expect(escapedIds).not.toContain(wildcardTrap.id);
+    expect(escapedIds).not.toContain(both.id);
+
+    // Caps >8 distinct terms to bound query/scan cost (case-insensitive ASCII dedupe keeps distinct slots).
+    const many = await json(await api(`/api/v1/artifacts?q=${encodeURIComponent('Q4 q4 系统 架构 说明 复盘 系 统 架 额外不匹配词')}`), 200);
+    expect(many.items.map((i: any) => i.id)).toContain(both.id);
+
+    // Works together with visibility filter and cursor pagination.
+    const page1 = await json(await api(`/api/v1/artifacts?q=${encodeURIComponent('系统 架构')}&visibility=public&limit=1`), 200);
+    expect(page1.items).toHaveLength(1);
+    expect(page1.next_cursor).toBeTruthy();
+    const page2 = await json(await api(`/api/v1/artifacts?q=${encodeURIComponent('系统 架构')}&visibility=public&limit=1&cursor=${encodeURIComponent(page1.next_cursor)}`), 200);
+    expect(page2.next_cursor).toBeNull();
+    expect([page1.items[0].id, page2.items[0].id].sort()).toEqual([both.id, onlyArch.id].sort());
+  });
 });
 
 describe('review regressions', () => {

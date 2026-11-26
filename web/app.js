@@ -311,8 +311,14 @@ async function viewList() {
     if (search.value.trim()) qs.set('q', search.value.trim());
     if (vis.value) qs.set('visibility', vis.value);
     if (!reset && cursor) qs.set('cursor', cursor);
-    const data = await api('GET', `/api/v1/artifacts?${qs}`);
-    if (mine !== seq) return;
+    let data;
+    try {
+      data = await api('GET', `/api/v1/artifacts?${qs}`);
+    } catch (e) {
+      if (mine === seq && tbody.isConnected) toast(e.message, 'error');
+      return;
+    }
+    if (mine !== seq || !tbody.isConnected) return;
     if (reset) tbody.replaceChildren();
     for (const a of data.items) {
       tbody.append(
@@ -336,13 +342,27 @@ async function viewList() {
     more.hidden = !cursor;
     const none = tbody.children.length === 0;
     wrap.hidden = none;
-    empty.hidden = !none || !!search.value || !!vis.value;
+    empty.hidden = !none || !!search.value.trim() || !!vis.value;
   }
 
   let timer;
-  search.addEventListener('input', () => {
+  let composing = false;
+  const scheduleSearch = () => {
     clearTimeout(timer);
-    timer = setTimeout(() => load(true), 250);
+    timer = setTimeout(() => {
+      if (tbody.isConnected) load(true);
+    }, 250);
+  };
+  search.addEventListener('compositionstart', () => {
+    composing = true;
+    clearTimeout(timer);
+  });
+  search.addEventListener('compositionend', () => {
+    composing = false;
+    scheduleSearch();
+  });
+  search.addEventListener('input', (e) => {
+    if (!composing && !e.isComposing) scheduleSearch();
   });
   vis.addEventListener('change', () => load(true));
   more.addEventListener('click', () => act(more, () => load(false)));
@@ -351,7 +371,7 @@ async function viewList() {
     h('div', { class: 'page-head' }, h('h1', {}, t('list.title')), h('a', { class: 'btn primary', href: '#/new' }, t('list.new'))),
     h('div', { class: 'stack' }, h('div', { class: 'row' }, h('div', { class: 'grow' }, search), vis), wrap, empty, h('div', { class: 'row' }, more)),
   );
-  await load(true).catch((e) => toast(e.message, 'error'));
+  await load(true);
 }
 
 // ---------------- analytics ----------------
