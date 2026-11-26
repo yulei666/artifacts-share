@@ -4,6 +4,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 const MAIN = 'https://share.example.com';
 const ORIGIN = { origin: MAIN };
+const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36';
 const content = (id: string) => `https://${id}-share.example-content.com`;
 
 function fetchRaw(url: string, init: RequestInit = {}): Promise<Response> {
@@ -661,13 +662,36 @@ describe('review regressions (round 2)', () => {
 
   it('counts views served from the edge cache', async () => {
     const a = await createHtml('<p>count</p>', '?visibility=public');
-    for (let i = 0; i < 3; i++) await (await fetchRaw(a.content_url, { headers: { 'sec-fetch-dest': 'document' } })).arrayBuffer();
+    for (let i = 0; i < 3; i++) await (await fetchRaw(a.content_url, { headers: { 'sec-fetch-dest': 'document', 'user-agent': BROWSER_UA } })).arrayBuffer();
     let views = 0;
     for (let i = 0; i < 20 && views < 3; i++) {
       views = (await json(await api(`/api/v1/artifacts/${a.id}`), 200)).view_count;
       if (views < 3) await new Promise((r) => setTimeout(r, 25));
     }
     expect(views).toBe(3);
+  });
+
+  it('excludes bots, CLIs, and browser prefetches from D1 view_count', async () => {
+    const a = await createHtml('<p>filtered</p>', '?visibility=public');
+    const ignored: Record<string, string>[] = [
+      { 'sec-fetch-dest': 'document', 'user-agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' },
+      { 'sec-fetch-dest': 'document', 'user-agent': 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.0' },
+      { 'sec-fetch-dest': 'document', 'user-agent': 'Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)' },
+      { 'sec-fetch-dest': 'document', 'user-agent': 'curl/8.7.1' },
+      { 'sec-fetch-dest': 'document' }, // empty User-Agent → cli
+      { 'sec-fetch-dest': 'document', 'user-agent': BROWSER_UA, 'sec-purpose': 'prefetch' },
+      { 'sec-fetch-dest': 'document', 'user-agent': BROWSER_UA, 'sec-purpose': 'prefetch;prerender' },
+      { 'sec-fetch-dest': 'document', 'user-agent': BROWSER_UA, purpose: 'prefetch' },
+    ];
+    for (const headers of ignored) await (await fetchRaw(a.content_url, { headers })).arrayBuffer();
+    await (await fetchRaw(a.content_url, { headers: { 'sec-fetch-dest': 'iframe', 'user-agent': BROWSER_UA } })).arrayBuffer();
+    let views = 0;
+    for (let i = 0; i < 20 && views < 1; i++) {
+      views = (await json(await api(`/api/v1/artifacts/${a.id}`), 200)).view_count;
+      if (views < 1) await new Promise((r) => setTimeout(r, 25));
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    expect((await json(await api(`/api/v1/artifacts/${a.id}`), 200)).view_count).toBe(1);
   });
 });
 
@@ -1505,7 +1529,7 @@ describe('review regressions (round 4)', () => {
 
   it('counts views loaded in the share page iframe', async () => {
     const a = await createHtml('<p>v</p>', '?visibility=public');
-    await (await fetchRaw(a.content_url, { headers: { 'sec-fetch-dest': 'iframe' } })).arrayBuffer();
+    await (await fetchRaw(a.content_url, { headers: { 'sec-fetch-dest': 'iframe', 'user-agent': BROWSER_UA } })).arrayBuffer();
     let views = 0;
     for (let i = 0; i < 20 && views < 1; i++) {
       views = (await json(await api(`/api/v1/artifacts/${a.id}`), 200)).view_count;
@@ -1885,7 +1909,7 @@ describe('review regressions (round 9)', () => {
 
   it('counts successful page loads only, including SPA routes', async () => {
     const a = await createHtml('<p>spa</p>', '?visibility=public&spa_fallback=true');
-    const get = async (p: string) => (await fetchRaw(`${a.content_url}${p}`, { headers: { 'sec-fetch-dest': 'document', accept: 'text/html' } })).arrayBuffer();
+    const get = async (p: string) => (await fetchRaw(`${a.content_url}${p}`, { headers: { 'sec-fetch-dest': 'document', accept: 'text/html', 'user-agent': BROWSER_UA } })).arrayBuffer();
     await get('missing.html'); // SPA fallback → entry, a real page load
     await get('dashboard'); // extension-less SPA route
     expect(await viewsOf(a.id, 2)).toBe(2);
