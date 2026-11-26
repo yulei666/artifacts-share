@@ -99,13 +99,13 @@ export async function handleContent(req: Request, env: Env, execCtx: ExecutionCo
   if (req.method !== 'GET' && req.method !== 'HEAD') return new Response('Method not allowed', { status: 405, headers: { allow: 'GET, HEAD' } });
 
   const ownerLogin = `${mainOrigin(env, url)}/handoff?id=${id}&next=${encodeURIComponent(returnPath(url))}`;
-  const a = await getArtifactByPublicId(env, id);
+  const cookies = parseCookies(req.headers.get('cookie'));
+  const [a, owner] = cookies['__Host-as_owner']
+    ? await Promise.all([getArtifactByPublicId(env, id), isOwner(env, cookies, id)])
+    : [await getArtifactByPublicId(env, id), false];
   if (!a || a.current_version == null) return notFoundPage(ctx, ownerLogin);
 
   const indexable = a.visibility === 'public' && !!a.indexable;
-
-  const cookies = parseCookies(req.headers.get('cookie'));
-  const owner = await isOwner(env, cookies, id);
 
   if (url.searchParams.has(CHECK_PARAM)) {
     const allowed = owner || a.visibility === 'public' || (a.visibility === 'password' && (await isUnlocked(env, cookies, a)));

@@ -588,6 +588,9 @@ describe('analytics read APIs', () => {
       if (sql.includes('blob6 AS path')) {
         return Response.json({ data: [{ path: 'docs/guide.md', views: 15 }, { path: 'index.html', views: 10 }] });
       }
+      if (sql.includes('index1 AS id') && sql.includes('index1 IN')) {
+        return Response.json({ data: [{ id: folder.id, views: 42 }] });
+      }
       if (sql.includes('index1 AS id')) {
         return Response.json({
           data: [
@@ -620,8 +623,8 @@ describe('analytics read APIs', () => {
       { path: 'docs/guide.md', views: 15 },
       { path: 'index.html', views: 10 },
     ]);
-    const rangeQueries = (list: string[]) => list.filter((q) => !q.startsWith('SELECT SUM(_sample_interval) AS total FROM'));
-    expect(queries.every((q) => q.includes(`index1 = '${folder.id}'`))).toBe(true);
+    const rangeQueries = (list: string[]) => list.filter((q) => !q.startsWith('SELECT SUM(_sample_interval) AS total FROM') && !q.includes('index1 IN ('));
+    expect(queries.every((q) => q.includes(`index1 = '${folder.id}'`) || q.includes(`index1 IN ('${folder.id}')`))).toBe(true);
     expect(queries.every((q) => q.includes("blob5 NOT IN ('bot', 'cli')"))).toBe(true);
     expect(rangeQueries(queries).every((q) => q.includes(`timestamp >= toDateTime(${detailRes.series[0].ts})`))).toBe(true);
     expect(queries.some((q) => q.includes(`toUInt32(timestamp) + ${shift}`))).toBe(true);
@@ -656,7 +659,8 @@ describe('analytics read APIs', () => {
     ]);
     const negTzRes = await json(rA, 200);
     expect(await json(rB, 200)).toEqual(negTzRes);
-    expect(fetchMock.mock.calls.length - beforeDedupCount).toBe(7); // deduplicated into a single 7-query batch (6 range + 1 views_90d)
+    expect(negTzRes.totals.views_90d).toBe(42);
+    expect(fetchMock.mock.calls.length - beforeDedupCount).toBe(6); // deduplicated into 6 range queries; views_90d reused from per-ID viewsCache
     expect(rangeQueries(queries).every((q) => q.includes(`timestamp >= toDateTime(${negTzRes.series[0].ts})`))).toBe(true);
     expect(queries.some((q) => q.includes(`toUInt32(timestamp) + ${86400 - 300 * 60}`))).toBe(true);
 
@@ -854,19 +858,19 @@ describe('analytics read APIs', () => {
     expect(r3).toEqual(r1);
     expect(spy).toHaveBeenCalledTimes(1);
 
-    // range=90d in queryAnalytics still runs rolling views_90d query consistently.
+    // range=90d in queryAnalytics still runs rolling views_90d query consistently via queryAnalyticsViews when bots=0.
     clearAnalyticsCache();
     const ninetySqls: string[] = [];
     spy.mockImplementation(async (_input, init) => {
       const sql = String(init?.body ?? '');
       ninetySqls.push(sql);
-      if (sql.startsWith('SELECT SUM(_sample_interval) AS total FROM')) return Response.json({ data: [{ total: 50 }] });
+      if (sql.includes('index1 IN (')) return Response.json({ data: [{ id: a.id, views: 50 }] });
       if (sql.includes('GROUP BY event') && !sql.includes('GROUP BY bucket_ts')) return Response.json({ data: [{ event: 'view', total: 30, uv: 10, no_ref: 0 }] });
       return Response.json({ data: [] });
     });
     const ninety = await json(await api(`/api/v1/artifacts/${a.id}/analytics?range=90d&tz=480&bots=0`, { env: testEnv }), 200);
     expect(ninety.totals.views_90d).toBe(50);
-    expect(ninetySqls.some((s) => s.startsWith('SELECT SUM(_sample_interval) AS total FROM'))).toBe(true);
+    expect(ninetySqls.some((s) => s.includes(`index1 IN ('${a.id}')`))).toBe(true);
 
     // dataset_missing returns zeros without caching
     clearAnalyticsCache();
@@ -887,5 +891,205 @@ describe('analytics read APIs', () => {
       window_days: 90,
       views: { [a.id]: 7 },
     });
+  });
+
+  it('caches views per artifact ID with partial hits and per-ID in-flight coalescing', async () => {
+    const a = await createArtifact('<p>a</p>', 'text/html', '?visibility=public&title=PerIdA');
+    const b = await createArtifact('<p>b</p>', 'text/html', '?visibility=public&title=PerIdB');
+    const c = await createArtifact('<p>c</p>', 'text/html', '?visibility=public&title=PerIdC');
+    const { testEnv } = makeAnalyticsEnv({ ANALYTICS_DATASET: 'per_id_ds' });
+
+    const counts: Record<string, number> = { [a.id]: 11, [b.id]: 22, [c.id]: 33 };
+    const sqls: string[] = [];
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const sql = String(init?.body ?? '');
+      sqls.push(sql);
+      const data = Object.entries(counts)
+        .filter(([id]) => sql.includes(`'${id}'`))
+        .map(([id, views]) => ({ id, views }));
+      return Response.json({ data });
+    });
+
+    // 1. Prime [a, b]
+    const r1 = await json(await api(`/api/v1/analytics/views?ids=${a.id},${b.id}`, { env: testEnv }), 200);
+    expect(r1).toEqual({ enabled: true, window_days: 90, views: { [a.id]: 11, [b.id]: 22 } });
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    // 2. Subset [a] -> 0 upstream fetches
+    const r2 = await json(await api(`/api/v1/analytics/views?ids=${a.id}`, { env: testEnv }), 200);
+    expect(r2).toEqual({ enabled: true, window_days: 90, views: { [a.id]: 11 } });
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    // 3. Partial hit [a, c] -> only c queried
+    const r3 = await json(await api(`/api/v1/analytics/views?ids=${a.id},${c.id}`, { env: testEnv }), 200);
+    expect(r3).toEqual({ enabled: true, window_days: 90, views: { [a.id]: 11, [c.id]: 33 } });
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(sqls[1]).toContain(`index1 IN ('${c.id}')`);
+    expect(sqls[1]).not.toContain(a.id);
+
+    // 4. Overlapping concurrent in-flight calls: [a, b] and [b, c] coalesce b without double-querying it
+    clearAnalyticsCache();
+    sqls.length = 0;
+    spy.mockClear();
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    spy.mockImplementation(async (_input, init) => {
+      const sql = String(init?.body ?? '');
+      sqls.push(sql);
+      if (sqls.length === 1) await firstGate;
+      const data = Object.entries(counts)
+        .filter(([id]) => sql.includes(`'${id}'`))
+        .map(([id, views]) => ({ id, views }));
+      return Response.json({ data });
+    });
+
+    const p1 = api(`/api/v1/analytics/views?ids=${a.id},${b.id}`, { env: testEnv });
+    const p2 = api(`/api/v1/analytics/views?ids=${b.id},${c.id}`, { env: testEnv });
+    releaseFirst();
+    const [res1, res2] = await Promise.all([p1, p2]);
+    expect(await json(res1, 200)).toEqual({ enabled: true, window_days: 90, views: { [a.id]: 11, [b.id]: 22 } });
+    expect(await json(res2, 200)).toEqual({ enabled: true, window_days: 90, views: { [b.id]: 22, [c.id]: 33 } });
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(sqls[1]).toContain(`index1 IN ('${c.id}')`);
+    expect(sqls[1]).not.toContain(b.id);
+  });
+
+  it('reuses list viewsCache on detail when bots=0, isolates bots=1, and caches site views_90d across range/tz', async () => {
+    const a = await createArtifact('<p>detail</p>', 'text/html', '?visibility=public&title=ReuseDetail');
+    const { testEnv } = makeAnalyticsEnv({ ANALYTICS_DATASET: 'reuse_ds' });
+
+    const sqls: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const sql = String(init?.body ?? '');
+      sqls.push(sql);
+      if (sql.includes('index1 IN (')) {
+        return Response.json({ data: [{ id: a.id, views: 77 }] });
+      }
+      if (sql.startsWith('SELECT SUM(_sample_interval) AS total FROM')) {
+        const isBots = !sql.includes("blob5 NOT IN ('bot', 'cli')");
+        const isSite = !sql.includes(`index1 = '${a.id}'`);
+        return Response.json({ data: [{ total: isSite ? (isBots ? 555 : 444) : 99 }] });
+      }
+      if (sql.includes('GROUP BY event') && !sql.includes('GROUP BY bucket_ts')) {
+        return Response.json({ data: [{ event: 'view', total: 10, uv: 5, no_ref: 0 }] });
+      }
+      return Response.json({ data: [] });
+    });
+
+    // List page warms per-ID viewsCache for a.id
+    const listViews = await json(await api(`/api/v1/analytics/views?ids=${a.id}`, { env: testEnv }), 200);
+    expect(listViews.views[a.id]).toBe(77);
+    expect(sqls).toHaveLength(1);
+
+    // Detail page (bots=0) reuses viewsCache with 0 extra views_90d WAE queries (only 5 range queries for single HTML)
+    sqls.length = 0;
+    const detailNoBots = await json(await api(`/api/v1/artifacts/${a.id}/analytics?range=7d&tz=0&bots=0`, { env: testEnv }), 200);
+    expect(detailNoBots.totals.views_90d).toBe(77);
+    expect(sqls).toHaveLength(5);
+    expect(sqls.some((s) => s.includes('index1 IN (') || s.startsWith('SELECT SUM(_sample_interval) AS total FROM'))).toBe(false);
+
+    // Detail page (bots=1) must NOT reuse bot-excluded viewsCache
+    sqls.length = 0;
+    const detailBots = await json(await api(`/api/v1/artifacts/${a.id}/analytics?range=7d&tz=0&bots=1`, { env: testEnv }), 200);
+    expect(detailBots.totals.views_90d).toBe(99);
+    expect(sqls).toHaveLength(6);
+    expect(sqls.filter((s) => s.startsWith('SELECT SUM(_sample_interval) AS total FROM'))).toHaveLength(1);
+
+    // Detail page (bots=1) with different range reuses independent views_90d cache
+    sqls.length = 0;
+    const detailBots24h = await json(await api(`/api/v1/artifacts/${a.id}/analytics?range=24h&tz=480&bots=1`, { env: testEnv }), 200);
+    expect(detailBots24h.totals.views_90d).toBe(99);
+    expect(sqls).toHaveLength(5);
+    expect(sqls.some((s) => s.startsWith('SELECT SUM(_sample_interval) AS total FROM'))).toBe(false);
+
+    // Site-wide analytics caches views_90d independently across range and tz switches
+    sqls.length = 0;
+    const site7d = await json(await api('/api/v1/analytics?range=7d&tz=0&bots=0', { env: testEnv }), 200);
+    expect(site7d.totals.views_90d).toBe(444);
+    expect(sqls.filter((s) => s.startsWith('SELECT SUM(_sample_interval) AS total FROM'))).toHaveLength(1);
+
+    sqls.length = 0;
+    const site24h = await json(await api('/api/v1/analytics?range=24h&tz=480&bots=0', { env: testEnv }), 200);
+    expect(site24h.totals.views_90d).toBe(444);
+    expect(sqls.filter((s) => s.startsWith('SELECT SUM(_sample_interval) AS total FROM'))).toHaveLength(0);
+
+    // Switching bots=1 on site-wide uses a distinct views_90d cache key
+    sqls.length = 0;
+    const siteBots = await json(await api('/api/v1/analytics?range=24h&tz=480&bots=1', { env: testEnv }), 200);
+    expect(siteBots.totals.views_90d).toBe(555);
+    expect(sqls.filter((s) => s.startsWith('SELECT SUM(_sample_interval) AS total FROM'))).toHaveLength(1);
+  });
+
+  it('caps concurrent outbound WAE fetches to at most 6 on uncached site-wide queryAnalytics', async () => {
+    const { testEnv } = makeAnalyticsEnv({ ANALYTICS_DATASET: 'conc_ds' });
+    let inFlightCount = 0;
+    let maxInFlight = 0;
+    let totalCalls = 0;
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      totalCalls++;
+      inFlightCount++;
+      if (inFlightCount > maxInFlight) maxInFlight = inFlightCount;
+      await new Promise((r) => setTimeout(r, 10));
+      inFlightCount--;
+      return Response.json({ data: [] });
+    });
+
+    const res = await json(await api('/api/v1/analytics?range=7d&tz=0&bots=0', { env: testEnv }), 200);
+    expect(res.enabled).toBe(true);
+    expect(totalCalls).toBe(7);
+    expect(maxInFlight).toBe(6);
+  });
+
+  it('does not cache zeros in viewsCache or independent views_90d cache when dataset is missing', async () => {
+    const a = await createArtifact('<p>m1</p>', 'text/html', '?visibility=public&title=Miss1');
+    const b = await createArtifact('<p>m2</p>', 'text/html', '?visibility=public&title=Miss2');
+    const { testEnv } = makeAnalyticsEnv({ ANALYTICS_DATASET: 'missing_ds' });
+
+    const sqls: string[] = [];
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      sqls.push(String(init?.body ?? ''));
+      return new Response('Table missing_ds does not exist', { status: 400 });
+    });
+
+    // Per-ID viewsCache must not cache zeros on dataset_missing
+    const v1 = await json(await api(`/api/v1/analytics/views?ids=${a.id},${b.id}`, { env: testEnv }), 200);
+    expect(v1).toEqual({ enabled: true, dataset_missing: true, window_days: 90, views: { [a.id]: 0, [b.id]: 0 } });
+    const v2 = await json(await api(`/api/v1/analytics/views?ids=${a.id}`, { env: testEnv }), 200);
+    expect(v2).toEqual({ enabled: true, dataset_missing: true, window_days: 90, views: { [a.id]: 0 } });
+    expect(spy).toHaveBeenCalledTimes(2);
+
+    // Site-wide views_90d independent cache must not cache zeros on dataset_missing across range changes
+    sqls.length = 0;
+    const s1 = await json(await api('/api/v1/analytics?range=7d&tz=0&bots=0', { env: testEnv }), 200);
+    expect(s1.dataset_missing).toBe(true);
+    expect(sqls.filter((s) => s.startsWith('SELECT SUM(_sample_interval) AS total FROM'))).toHaveLength(1);
+
+    sqls.length = 0;
+    const s2 = await json(await api('/api/v1/analytics?range=24h&tz=0&bots=0', { env: testEnv }), 200);
+    expect(s2.dataset_missing).toBe(true);
+    expect(sqls.filter((s) => s.startsWith('SELECT SUM(_sample_interval) AS total FROM'))).toHaveLength(1);
+  });
+
+  it('truncates ASCII and multi-byte UTF-8 referer hosts and paths within byte budgets', async () => {
+    const a = await createArtifact('<p>utf8</p>', 'text/html', '?visibility=public&title=Utf8Path');
+    const { testEnv, points } = makeAnalyticsEnv();
+    const asciiHost = `${'a'.repeat(60)}.${'b'.repeat(60)}.example.com`;
+    expect(classifyReferer(`https://${asciiHost}/page`, testEnv)).toBe(asciiHost.slice(0, 128));
+    expect(classifyReferer('https://short.example.com/page', testEnv)).toBe('short.example.com');
+
+    // Exercise recordView path truncation for both short ASCII (fast path) and multi-byte UTF-8 (>256 bytes)
+    const { recordView } = await import('../src/lib/analytics');
+    const { ctx, flush } = makeCtx();
+    const req = new Request(a.content_url, { headers: { 'user-agent': 'Mozilla/5.0 Chrome/130.0' } });
+    recordView(testEnv, ctx, req, a, 'docs/index.html', 10);
+    recordView(testEnv, ctx, req, a, '测'.repeat(100), 10); // 300 UTF-8 bytes -> max 85 chars (255 bytes)
+    await flush();
+    expect(points).toHaveLength(2);
+    expect(points[0].blobs?.[5]).toBe('docs/index.html');
+    expect(points[1].blobs?.[5]).toBe('测'.repeat(85));
+    expect(new TextEncoder().encode(String(points[1].blobs?.[5])).byteLength).toBe(255);
   });
 });

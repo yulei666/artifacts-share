@@ -107,9 +107,32 @@ export async function getArtifact(env: Env, id: string): Promise<ArtifactRow | n
   return env.DB.prepare('SELECT * FROM artifacts WHERE id = ? AND deleted_at IS NULL').bind(id).first<ArtifactRow>();
 }
 
-/** Looks up an artifact by its subdomain id. */
+const artifactByPublicIdInFlight = new WeakMap<D1Database, Map<string, Promise<ArtifactRow | null>>>();
+
+/** Looks up an artifact by its subdomain id, coalescing concurrent in-flight reads per isolate. */
 export async function getArtifactByPublicId(env: Env, publicId: string): Promise<ArtifactRow | null> {
-  return env.DB.prepare('SELECT * FROM artifacts WHERE public_id = ? AND deleted_at IS NULL').bind(publicId).first<ArtifactRow>();
+  let inFlight = artifactByPublicIdInFlight.get(env.DB);
+  if (!inFlight) {
+    inFlight = new Map();
+    artifactByPublicIdInFlight.set(env.DB, inFlight);
+  }
+  const existing = inFlight.get(publicId);
+  if (existing) return existing;
+  const currentMap = inFlight;
+  let settled = false;
+  let pending: Promise<ArtifactRow | null> | undefined;
+  pending = (async () => {
+    try {
+      return await env.DB.prepare('SELECT * FROM artifacts WHERE public_id = ? AND deleted_at IS NULL')
+        .bind(publicId)
+        .first<ArtifactRow>();
+    } finally {
+      settled = true;
+      if (currentMap.get(publicId) === pending) currentMap.delete(publicId);
+    }
+  })();
+  if (!settled) currentMap.set(publicId, pending);
+  return pending;
 }
 
 export async function requireArtifact(env: Env, id: string): Promise<ArtifactRow> {
@@ -177,13 +200,15 @@ export async function patchArtifact(env: Env, a: ArtifactRow, meta: ArtifactMeta
     binds.push(meta.entry);
   }
   if (opts.resetPassword) where.push("visibility = 'password'");
-  const result = await env.DB.prepare(`UPDATE artifacts SET ${sets.join(', ')} WHERE ${where.join(' AND ')}`).bind(...binds).run();
-  if (!result.meta.changes) {
+  const updated = await env.DB.prepare(`UPDATE artifacts SET ${sets.join(', ')} WHERE ${where.join(' AND ')} RETURNING *`)
+    .bind(...binds)
+    .first<ArtifactRow>();
+  if (!updated) {
     await requireArtifact(env, a.id);
     if (opts.resetPassword) throw new HttpError(400, 'not_password_protected', 'Artifact is not in password mode');
     throw new HttpError(400, 'invalid_entry', `Entry file not found: ${meta.entry}`);
   }
-  return requireArtifact(env, a.id);
+  return updated;
 }
 
 /**
@@ -193,17 +218,22 @@ export async function patchArtifact(env: Env, a: ArtifactRow, meta: ArtifactMeta
 export async function regenerateLink(env: Env, a: ArtifactRow, opts: { resetPassword?: boolean } = {}): Promise<ArtifactRow> {
   const publicId = crypto.randomUUID();
   if (opts.resetPassword) {
-    const result = await env.DB.prepare("UPDATE artifacts SET public_id = ?, password_enc = ?, password_ver = password_ver + 1, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND visibility = 'password'")
+    const updated = await env.DB.prepare(
+      "UPDATE artifacts SET public_id = ?, password_enc = ?, password_ver = password_ver + 1, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND visibility = 'password' RETURNING *",
+    )
       .bind(publicId, await encryptString(env.SECRET_KEY, randomAccessCode()), now(), a.id)
-      .run();
-    if (!result.meta.changes) {
+      .first<ArtifactRow>();
+    if (!updated) {
       await requireArtifact(env, a.id);
       throw new HttpError(400, 'not_password_protected', 'Artifact is not in password mode');
     }
-  } else {
-    await env.DB.prepare('UPDATE artifacts SET public_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').bind(publicId, now(), a.id).run();
+    return updated;
   }
-  return requireArtifact(env, a.id);
+  const updated = await env.DB.prepare('UPDATE artifacts SET public_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL RETURNING *')
+    .bind(publicId, now(), a.id)
+    .first<ArtifactRow>();
+  if (!updated) throw new HttpError(404, 'not_found', 'Artifact not found');
+  return updated;
 }
 
 export async function softDeleteArtifact(env: Env, id: string): Promise<void> {

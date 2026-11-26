@@ -139,23 +139,38 @@ function areaFromLine(linePath, points, yBase) {
   return `${linePath}L${last.x.toFixed(2)},${yBase.toFixed(2)}L${first.x.toFixed(2)},${yBase.toFixed(2)}Z`;
 }
 
+let dateFormattersLocale = '';
+let dateFormatters = null;
+function getDateFormatters() {
+  const loc = locale();
+  if (dateFormattersLocale !== loc || !dateFormatters) {
+    dateFormattersLocale = loc;
+    dateFormatters = {
+      axisDay: new Intl.DateTimeFormat(loc, { month: 'numeric', day: 'numeric', timeZone: 'UTC' }),
+      tipHour: new Intl.DateTimeFormat(loc, { month: 'short', day: 'numeric', timeZone: 'UTC' }),
+      tipDay: new Intl.DateTimeFormat(loc, { month: 'short', day: 'numeric', weekday: 'short', timeZone: 'UTC' }),
+    };
+  }
+  return dateFormatters;
+}
+
 function formatBucketAxis(ts, bucket, tzMin) {
   const d = new Date((ts + tzMin * 60) * 1000);
   if (bucket === 'hour') {
     const hh = String(d.getUTCHours()).padStart(2, '0');
     return `${hh}:00`;
   }
-  return new Intl.DateTimeFormat(locale(), { month: 'numeric', day: 'numeric', timeZone: 'UTC' }).format(d);
+  return getDateFormatters().axisDay.format(d);
 }
 
 function formatBucketTooltip(ts, bucket, tzMin) {
   const d = new Date((ts + tzMin * 60) * 1000);
   if (bucket === 'hour') {
-    const datePart = new Intl.DateTimeFormat(locale(), { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(d);
+    const datePart = getDateFormatters().tipHour.format(d);
     const hh = String(d.getUTCHours()).padStart(2, '0');
     return `${datePart} ${hh}:00`;
   }
-  return new Intl.DateTimeFormat(locale(), { month: 'short', day: 'numeric', weekday: 'short', timeZone: 'UTC' }).format(d);
+  return getDateFormatters().tipDay.format(d);
 }
 
 function pickLabelIndices(n, plotW, compact) {
@@ -515,6 +530,7 @@ export function createAnalyticsPanel({ api, artifactId = null, kind = null, onNa
         hideHover();
         return;
       }
+      if (!isTouch && activeIdx === idx && !tooltip.hidden) return;
       activeIdx = idx;
       const pt = series[idx];
       const cx = xAt(idx);

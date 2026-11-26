@@ -94,8 +94,23 @@ async function viewable(c: AppContext, publicId: string) {
 app.get('/s/:pid/', (c) => c.redirect(`/s/${encodeURIComponent(c.req.param('pid'))}${new URL(c.req.url).search}`, 301));
 app.get('/s/:pid', async (c) => {
   const v = await viewable(c, c.req.param('pid'));
-  if (v && !v.owner && c.req.method === 'GET') recordReferral(c.env, c.executionCtx, c.req.raw, v.a);
-  const shell = await c.env.ASSETS.fetch(new Request(new URL('/viewer', c.req.url)));
+  const isGet = c.req.method === 'GET';
+  if (v && !v.owner && isGet) recordReferral(c.env, c.executionCtx, c.req.raw, v.a);
+  const ref = new URL(c.req.url);
+  const shellReq = new Request(new URL('/viewer', ref));
+  if (v && isGet) {
+    const [shell, payload] = await Promise.all([c.env.ASSETS.fetch(shellReq), viewerInfo(c, v, ref)]);
+    const tag = `<script type="application/json" id="viewer-init">${JSON.stringify(payload).replace(/</g, '\\u003c')}</script>`;
+    const html = (await shell.text()).replace('</head>', () => `${tag}</head>`);
+    const headers = new Headers(shell.headers);
+    headers.delete('content-length');
+    headers.delete('etag');
+    headers.set('cache-control', 'private, no-store');
+    headers.set('x-robots-tag', v.a.visibility === 'public' && v.a.indexable ? 'all' : 'noindex, nofollow');
+    headers.append('link', `<${contentOrigin(c.env, v.a.public_id, ref)}>; rel=preconnect`);
+    return new Response(html, { status: 200, headers });
+  }
+  const shell = await c.env.ASSETS.fetch(shellReq);
   const res = new Response(shell.body, { status: v ? 200 : 404, headers: shell.headers });
   res.headers.set('cache-control', 'private, no-store');
   res.headers.set('x-robots-tag', v && v.a.visibility === 'public' && v.a.indexable ? 'all' : 'noindex, nofollow');
@@ -134,16 +149,14 @@ async function unlockMetaCookie(env: Env, req: Request, a: ArtifactRow): Promise
   return hostCookie(UNLOCK_META_COOKIE, token, UNLOCK_META_TTL);
 }
 
-// Metadata for the viewer bar. Non-owners learn only what the iframe would show them anyway.
-app.get('/api/public/artifacts/:pid', async (c) => {
-  const v = await viewable(c, c.req.param('pid'));
-  if (!v) throw new HttpError(404, 'not_found', 'Not found');
-  const { a, owner } = v;
-  const ref = new URL(c.req.url);
+async function viewerInfo(c: AppContext, { a, owner }: { a: ArtifactRow; owner: boolean }, ref: URL) {
   // An access-code artifact's title is withheld until the visitor verifies the code.
-  const titleVisible = owner || a.visibility !== 'password' || (await hasUnlockMeta(c.env, c.req.raw, a));
+  const [titleVisible, download] = await Promise.all([
+    owner || a.visibility !== 'password' ? true : hasUnlockMeta(c.env, c.req.raw, a),
+    downloadInfo(c.env, c.req.raw, a, owner),
+  ]);
   const base = {
-    download: await downloadInfo(c.env, c.req.raw, a, owner),
+    download,
     public_id: a.public_id,
     title: titleVisible ? a.title : null,
     visibility: a.visibility,
@@ -151,13 +164,20 @@ app.get('/api/public/artifacts/:pid', async (c) => {
     content_url: `${contentOrigin(c.env, a.public_id, ref)}/`,
     owner,
   };
-  if (!owner) return c.json(base);
-  return c.json({
-    ...base,
-    artifact: await artifactView(c.env, a, ref),
+  if (!owner) return base;
+  const [artifact, frame_url] = await Promise.all([
+    artifactView(c.env, a, ref),
     // The iframe signs the owner in on the subdomain, so private/code-protected content shows directly.
-    frame_url: await ownerAuthUrl(c.env, ref, a.public_id, sessionOf(c)!.sessionId),
-  });
+    ownerAuthUrl(c.env, ref, a.public_id, sessionOf(c)!.sessionId),
+  ]);
+  return { ...base, artifact, frame_url };
+}
+
+// Metadata for the viewer bar. Non-owners learn only what the iframe would show them anyway.
+app.get('/api/public/artifacts/:pid', async (c) => {
+  const v = await viewable(c, c.req.param('pid'));
+  if (!v) throw new HttpError(404, 'not_found', 'Not found');
+  return c.json(await viewerInfo(c, v, new URL(c.req.url)));
 });
 
 // Verifies an access code (from ?pwd=) or a signed iframe unlock proof so the viewer bar can show the real title (and keep it on reload).
@@ -226,12 +246,26 @@ app.post('/api/auth/login', async (c) => {
     throw new HttpError(400, 'invalid_request', 'Username and password required');
   }
   // Settings that make password sign-in impossible are answered before anything is counted.
-  const hash = await getInternal(c.env, 'admin_password_hash');
-  const settings = await getSettings(c.env, { fresh: true });
-  if (hash && !settings.password_login_enabled) throw new HttpError(403, 'password_login_disabled', 'Password sign-in is disabled');
+  // Read fresh from D1 in one query (bypassing the 30 s settings cache) to keep auth decisions consistent across isolates.
+  const { results: settingRows } = await c.env.DB.prepare(
+    "SELECT key, value FROM settings WHERE key IN ('admin_password_hash', 'admin_username', 'password_login_enabled')",
+  ).all<{ key: string; value: string }>();
+  const settingMap = new Map(settingRows.map((r) => [r.key, r.value]));
+  const hash = settingMap.get('admin_password_hash') ?? null;
+  let passwordLoginEnabled = true;
+  const rawPasswordLogin = settingMap.get('password_login_enabled');
+  if (rawPasswordLogin !== undefined) {
+    try {
+      const parsed = JSON.parse(rawPasswordLogin);
+      if (typeof parsed === 'boolean') passwordLoginEnabled = parsed;
+    } catch {
+      /* ignore corrupt values, matching getSettings */
+    }
+  }
+  if (hash && !passwordLoginEnabled) throw new HttpError(403, 'password_login_disabled', 'Password sign-in is disabled');
   if (!hash && !c.env.ADMIN_BOOTSTRAP_PASSWORD) throw new HttpError(503, 'not_configured', 'ADMIN_BOOTSTRAP_PASSWORD is not set');
 
-  const storedUsername = await getInternal(c.env, 'admin_username');
+  const storedUsername = settingMap.get('admin_username') ?? null;
   const expectedUsername = storedUsername ?? (c.env.ADMIN_USERNAME?.trim() || 'admin');
   const method = hash ? 'password' : 'bootstrap';
   const result = await guardedAttempt(c.env, c.req.raw, loginBucket(c.req.raw), typeof turnstile_token === 'string' ? turnstile_token : null, async () => {

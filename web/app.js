@@ -2,7 +2,6 @@
 import { errorText, lang, locale, t } from './i18n.js';
 import { act, ApiError, brandLogo, copy, fmtBytes, githubProjectLink, h, langToggle, mountTurnstile, request, ssoIcon, toast, VISIBILITIES } from './ui.js';
 import { pickMarkdownIndex } from './markdown-index.js';
-import { createAnalyticsPanel } from './analytics.js';
 
 // ---------------- helpers ----------------
 
@@ -16,8 +15,14 @@ async function api(method, path, body) {
     return await request(method, path, body);
   } catch (e) {
     if (e instanceof ApiError) {
-      if (e.status === 401 && !path.startsWith('/api/auth/')) go('/login');
-      if (e.code === 'password_setup_required') go('/setup');
+      if (e.status === 401 && !path.startsWith('/api/auth/')) {
+        me = null;
+        if (parseHash().path !== '/login') go('/login');
+      }
+      if (e.code === 'password_setup_required') {
+        me = null;
+        if (parseHash().path !== '/setup') go('/setup');
+      }
     }
     throw e;
   }
@@ -76,8 +81,10 @@ function go(path) {
 }
 
 let me = null;
+let routeSeq = 0;
 
 async function render() {
+  const seq = ++routeSeq;
   setMenuOpen(false);
   const { path, query } = parseHash();
   const top = $topbar;
@@ -90,8 +97,10 @@ async function render() {
     try {
       me = await api('GET', '/api/auth/me');
     } catch {
+      if (seq !== routeSeq) return;
       return go(`/login?next=${encodeURIComponent('/#' + path)}`);
     }
+    if (seq !== routeSeq) return;
   }
   if (path === '/setup' && !me.needs_password_setup) return go('/');
   if (me.needs_password_setup) {
@@ -405,16 +414,26 @@ async function viewList() {
 
 // ---------------- analytics ----------------
 
-function viewAnalytics() {
-  const panel = createAnalyticsPanel({
-    api,
-    onNavigateArtifact: (id) => go(`/a/${id}`),
-  });
-  mount(
-    h('div', { class: 'page-head' }, h('h1', {}, t('analytics.title')), panel.controls),
-    panel.root,
-  );
-  panel.load();
+async function viewAnalytics() {
+  const seq = ++routeSeq;
+  const head = h('div', { class: 'page-head' }, h('h1', {}, t('analytics.title')));
+  const body = h('div', {}, h('p', { class: 'muted small an-loading' }, t('analytics.loading')));
+  mount(head, body);
+  try {
+    const { createAnalyticsPanel } = await import('./analytics.js');
+    if (seq !== routeSeq || !body.isConnected) return;
+    const panel = createAnalyticsPanel({
+      api,
+      onNavigateArtifact: (id) => go(`/a/${id}`),
+    });
+    head.append(panel.controls);
+    body.replaceWith(panel.root);
+    panel.load();
+  } catch {
+    if (seq !== routeSeq || !body.isConnected) return;
+    const retry = h('button', { type: 'button', class: 'sm', onclick: () => viewAnalytics() }, t('analytics.retry'));
+    body.replaceChildren(h('div', { class: 'card an-error' }, h('p', { class: 'err' }, t('analytics.loadFailed')), retry));
+  }
 }
 
 // ---------------- upload ----------------
@@ -553,7 +572,8 @@ function uploadPanel({ artifactId, currentEntry, onDone }) {
     const paths = files.map((f) => f.path);
     const html = paths.filter((p) => /\.html?$/i.test(p));
     const markdown = paths.filter((p) => /\.(?:md|markdown)$/i.test(p));
-    const current = paths.includes(currentEntry) ? currentEntry : null;
+    const curEntry = typeof currentEntry === 'function' ? currentEntry() : currentEntry;
+    const current = paths.includes(curEntry) ? curEntry : null;
     const preferredMarkdown = pickMarkdownIndex(markdown) ?? (markdown.length === 1 ? markdown[0] : null);
     const preferred = current ?? (paths.includes('index.html') ? 'index.html' : null)
       ?? (html.length === 1 ? html[0] : null) ?? (!html.length ? preferredMarkdown : null)
@@ -637,7 +657,7 @@ function uploadPanel({ artifactId, currentEntry, onDone }) {
       };
       try {
         const results = await Promise.allSettled(
-          Array.from({ length: Math.min(4, toSend.length) }, () =>
+          Array.from({ length: Math.min(6, toSend.length) }, () =>
             worker().catch((e) => {
               failed = true;
               throw e;
@@ -685,72 +705,170 @@ function viewNew() {
 // ---------------- detail ----------------
 
 async function viewDetail(id) {
+  const seq = ++routeSeq;
+  const useWae = !!me?.analytics_enabled;
+  const artifactReq = api('GET', `/api/v1/artifacts/${id}`);
+  const versionsReq = api('GET', `/api/v1/artifacts/${id}/versions`);
+  const filesReq = api('GET', `/api/v1/artifacts/${id}/files`);
+  const viewsReq = useWae
+    ? api('GET', `/api/v1/analytics/views?ids=${encodeURIComponent(id)}`).then(
+        (res) => ({ ok: true, res }),
+        () => ({ ok: false }),
+      )
+    : null;
+
   let a;
+  let versions;
+  let files;
   try {
-    a = await api('GET', `/api/v1/artifacts/${id}`);
+    [a, versions, files] = await Promise.all([artifactReq, versionsReq, filesReq]);
   } catch (e) {
+    if (seq !== routeSeq) return;
     toast(e.message, 'error');
+    if (e instanceof ApiError && (e.status === 401 || e.code === 'password_setup_required')) return;
     return go('/');
   }
-  const [versions, files] = await Promise.all([api('GET', `/api/v1/artifacts/${id}/versions`), api('GET', `/api/v1/artifacts/${id}/files`)]);
+  if (seq !== routeSeq) return;
+
+  const openBtn = h('a', { class: 'btn primary', href: a.url, target: '_blank', rel: 'noopener' }, t('detail.open'));
+  const linkCodeEl = h('code', {}, a.url);
+  const updatedVal = h('div', { class: 'v' }, fmtAgo(a.updated_at));
+  const title = h('input', { value: a.title, placeholder: t('common.untitled') });
+  const visHelp = h('p', { class: 'muted' }, t(`detail.help.${a.visibility}`));
+
+  const passwordBox = h('div', { class: 'row', hidden: a.visibility !== 'password' });
+  let passwordCodeEl = null;
+  function renderPasswordBox() {
+    if (a.visibility !== 'password') {
+      passwordBox.hidden = true;
+      passwordBox.replaceChildren();
+      passwordCodeEl = null;
+      return;
+    }
+    if (!passwordCodeEl) {
+      passwordCodeEl = h('span', { class: 'code' }, a.password ?? '');
+      const reset = h(
+        'button',
+        {
+          class: 'sm',
+          type: 'button',
+          onclick: () =>
+            confirm(t('detail.regenerateConfirm')) &&
+            act(reset, () =>
+              api('POST', `/api/v1/artifacts/${id}/password/reset`).then((r) => {
+                syncArtifact(r);
+                toast(t('detail.regenerated'));
+              }),
+            ),
+        },
+        t('detail.regenerate'),
+      );
+      passwordBox.replaceChildren(
+        passwordCodeEl,
+        h('div', { class: 'grow' }),
+        h('button', { class: 'sm', type: 'button', onclick: () => copy(a.password, t('detail.codeCopied')) }, t('detail.copyCode')),
+        h('button', { class: 'sm', type: 'button', onclick: () => copy(`${a.url}?pwd=${a.password}`, t('detail.linkCodeCopied')) }, t('detail.copyLinkCode')),
+        reset,
+      );
+    } else {
+      passwordCodeEl.textContent = a.password ?? '';
+    }
+    passwordBox.hidden = false;
+  }
+
+  const segBtns = {};
+  const seg = h(
+    'div',
+    { class: 'seg' },
+    ...VISIBILITIES.map((v) => {
+      const b = h(
+        'button',
+        {
+          type: 'button',
+          class: v === a.visibility ? 'on' : '',
+          onclick: () => v !== a.visibility && act(b, () => patch({ visibility: v })),
+        },
+        visLabel(v),
+      );
+      segBtns[v] = b;
+      return b;
+    }),
+  );
+
+  const indexable = h('input', {
+    type: 'checkbox',
+    checked: a.indexable,
+    disabled: a.visibility !== 'public',
+    onchange: () =>
+      act(null, () =>
+        patch({ indexable: indexable.checked }).catch((e) => {
+          indexable.checked = a.indexable;
+          throw e;
+        }),
+      ),
+  });
+  const spa = h('input', {
+    type: 'checkbox',
+    checked: a.spa_fallback,
+    onchange: () =>
+      act(null, () =>
+        patch({ spa_fallback: spa.checked }).catch((e) => {
+          spa.checked = a.spa_fallback;
+          throw e;
+        }),
+      ),
+  });
+  const entryFiles = files.items.filter((f) => f.path === a.entry || /\.(?:html?|md|markdown)$/i.test(f.path)).map((f) => f.path);
+  const entry = h(
+    'select',
+    {
+      onchange: () =>
+        act(null, () =>
+          patch({ entry: entry.value }).catch((e) => {
+            entry.value = a.entry;
+            throw e;
+          }),
+        ),
+    },
+    ...entryFiles.map((p) => h('option', { value: p, selected: p === a.entry }, p)),
+  );
+
+  function syncArtifact(r) {
+    a = { ...a, ...r };
+    title.value = a.title;
+    linkCodeEl.textContent = a.url;
+    openBtn.href = a.url;
+    for (const [v, b] of Object.entries(segBtns)) b.classList.toggle('on', v === a.visibility);
+    visHelp.textContent = t(`detail.help.${a.visibility}`);
+    renderPasswordBox();
+    indexable.checked = a.indexable;
+    indexable.disabled = a.visibility !== 'public';
+    spa.checked = a.spa_fallback;
+    if (entryFiles.includes(a.entry)) entry.value = a.entry;
+    updatedVal.textContent = fmtAgo(a.updated_at);
+  }
+
+  renderPasswordBox();
+
   const patch = (body) =>
     api('PATCH', `/api/v1/artifacts/${id}`, body).then((r) => {
+      syncArtifact(r);
       toast(t('common.saved'));
-      viewDetail(id);
       return r;
     });
 
-  const openUrl = a.url; // viewer page on the main domain
   const regenLink = h('button', { class: 'sm', type: 'button' }, t('detail.regenLink'));
   regenLink.onclick = () => {
     if (!confirm(t('detail.regenLinkConfirm'))) return;
     const resetPassword = a.visibility === 'password' && confirm(t('detail.regenLinkAlsoCode'));
     act(regenLink, () =>
-      api('POST', `/api/v1/artifacts/${id}/regenerate-link`, { reset_password: resetPassword }).then(() => {
+      api('POST', `/api/v1/artifacts/${id}/regenerate-link`, { reset_password: resetPassword }).then((r) => {
+        syncArtifact(r);
         toast(t('detail.linkRegenerated'));
-        viewDetail(id);
       }),
     );
   };
-  const title = h('input', { value: a.title, placeholder: t('common.untitled') });
   const saveTitle = h('button', { class: 'sm', onclick: () => act(saveTitle, () => patch({ title: title.value })) }, t('common.save'));
-
-  const seg = h(
-    'div',
-    { class: 'seg' },
-    ...VISIBILITIES.map((v) => {
-      const b = h('button', { type: 'button', class: v === a.visibility ? 'on' : '', onclick: () => v !== a.visibility && act(b, () => patch({ visibility: v })) }, visLabel(v));
-      return b;
-    }),
-  );
-
-  let passwordBox = null;
-  if (a.visibility === 'password') {
-    const reset = h(
-      'button',
-      {
-        class: 'sm',
-        onclick: () =>
-          confirm(t('detail.regenerateConfirm')) &&
-          act(reset, () => api('POST', `/api/v1/artifacts/${id}/password/reset`).then(() => (toast(t('detail.regenerated')), viewDetail(id)))),
-      },
-      t('detail.regenerate'),
-    );
-    passwordBox = h(
-      'div',
-      { class: 'row' },
-      h('span', { class: 'code' }, a.password),
-      h('div', { class: 'grow' }),
-      h('button', { class: 'sm', onclick: () => copy(a.password, t('detail.codeCopied')) }, t('detail.copyCode')),
-      h('button', { class: 'sm', onclick: () => copy(`${a.url}?pwd=${a.password}`, t('detail.linkCodeCopied')) }, t('detail.copyLinkCode')),
-      reset,
-    );
-  }
-
-  const indexable = h('input', { type: 'checkbox', checked: a.indexable, disabled: a.visibility !== 'public', onchange: () => act(null, () => patch({ indexable: indexable.checked })) });
-  const spa = h('input', { type: 'checkbox', checked: a.spa_fallback, onchange: () => act(null, () => patch({ spa_fallback: spa.checked })) });
-  const entryFiles = files.items.filter((f) => f.path === a.entry || /\.(?:html?|md|markdown)$/i.test(f.path)).map((f) => f.path);
-  const entry = h('select', { onchange: () => act(null, () => patch({ entry: entry.value })) }, ...entryFiles.map((p) => h('option', { value: p, selected: p === a.entry }, p)));
 
   const del = h(
     'button',
@@ -784,19 +902,35 @@ async function viewDetail(id) {
     );
   });
 
-  const fileRows = files.items.map((f) =>
-    h(
-      'tr',
-      {},
-      h('td', { class: 'mono small' }, f.path),
-      h('td', { class: 'muted small' }, fmtBytes(f.size)),
-      h('td', {}, h('a', { class: 'small', href: `/api/v1/artifacts/${id}/files/${encodePath(f.path)}` }, t('detail.download'))),
-    ),
+  const fileListBody = h('tbody');
+  let filesRendered = false;
+  const fileListDetails = h(
+    'details',
+    { class: 'card' },
+    h('summary', {}, h('strong', {}, t('detail.fileList', { n: files.items.length }))),
+    h('div', { class: 'table-wrap', style: 'margin-top:12px' }, h('table', { class: 'table' }, fileListBody)),
   );
+  fileListDetails.addEventListener('toggle', () => {
+    if (!fileListDetails.open || filesRendered) return;
+    filesRendered = true;
+    const frag = document.createDocumentFragment();
+    for (const f of files.items) {
+      frag.append(
+        h(
+          'tr',
+          {},
+          h('td', { class: 'mono small' }, f.path),
+          h('td', { class: 'muted small' }, fmtBytes(f.size)),
+          h('td', {}, h('a', { class: 'small', href: `/api/v1/artifacts/${id}/files/${encodePath(f.path)}` }, t('detail.download'))),
+        ),
+      );
+    }
+    fileListBody.append(frag);
+  });
 
   let analyticsCard = null;
-  if (me?.analytics_enabled) {
-    let loaded = false;
+  if (useWae) {
+    let analyticsState = 'idle'; // 'idle' | 'loading' | 'loaded'
     const hint = h('span', { class: 'muted small an-summary-hint' }, t('analytics.detailHint'));
     const body = h('div', { class: 'an-detail-body' });
     analyticsCard = h(
@@ -805,9 +939,14 @@ async function viewDetail(id) {
       h('summary', {}, h('span', { class: 'an-summary-left' }, h('strong', {}, t('analytics.title'))), hint),
       body,
     );
-    analyticsCard.addEventListener('toggle', () => {
-      if (analyticsCard.open && !loaded) {
-        loaded = true;
+    const loadDetailAnalytics = async () => {
+      if (analyticsState !== 'idle') return;
+      analyticsState = 'loading';
+      body.replaceChildren(h('p', { class: 'muted small an-loading' }, t('analytics.loading')));
+      try {
+        const { createAnalyticsPanel } = await import('./analytics.js');
+        if (seq !== routeSeq || !analyticsCard.isConnected) return;
+        analyticsState = 'loaded';
         const panel = createAnalyticsPanel({
           api,
           artifactId: id,
@@ -819,16 +958,23 @@ async function viewDetail(id) {
         body.replaceChildren(h('div', { class: 'an-detail-head' }, panel.controls), panel.root);
         hint.textContent = t(`analytics.range.${panel.getRange()}`);
         panel.load();
+      } catch {
+        if (seq !== routeSeq || !analyticsCard.isConnected) return;
+        analyticsState = 'idle';
+        const retry = h('button', { type: 'button', class: 'sm', onclick: () => loadDetailAnalytics() }, t('analytics.retry'));
+        body.replaceChildren(h('div', { class: 'card an-error' }, h('p', { class: 'err' }, t('analytics.loadFailed')), retry));
       }
+    };
+    analyticsCard.addEventListener('toggle', () => {
+      if (analyticsCard.open) loadDetailAnalytics();
     });
   }
 
-  const useWae = !!me?.analytics_enabled;
   const viewsLabel = useWae ? [t('detail.views'), infoTip(t('list.colViews90dHint'))] : t('detail.views');
   const viewsVal = useWae ? h('div', { class: 'v muted' }, '…') : h('div', { class: 'v' }, a.view_count);
 
   mount(
-    h('div', { class: 'page-head' }, h('div', { class: 'row' }, h('a', { href: '#/', class: 'muted' }, t('detail.back'))), h('a', { class: 'btn primary', href: openUrl, target: '_blank', rel: 'noopener' }, t('detail.open'))),
+    h('div', { class: 'page-head' }, h('div', { class: 'row' }, h('a', { href: '#/', class: 'muted' }, t('detail.back'))), openBtn),
     h(
       'div',
       { class: 'stack' },
@@ -836,7 +982,7 @@ async function viewDetail(id) {
         'div',
         { class: 'card stack' },
         h('div', { class: 'row' }, h('div', { class: 'grow' }, title), saveTitle),
-        h('div', { class: 'linkbox' }, h('code', {}, a.url), h('button', { class: 'sm', onclick: () => copy(a.url, t('detail.linkCopied')) }, t('common.copy')), regenLink),
+        h('div', { class: 'linkbox' }, linkCodeEl, h('button', { class: 'sm', onclick: () => copy(a.url, t('detail.linkCopied')) }, t('common.copy')), regenLink),
         h(
           'div',
           { class: 'stats' },
@@ -846,11 +992,11 @@ async function viewDetail(id) {
             [t('detail.files'), a.file_count],
             [t('detail.size'), fmtBytes(a.total_size)],
             [viewsLabel, viewsVal],
-            [t('detail.updated'), fmtAgo(a.updated_at)],
+            [t('detail.updated'), updatedVal],
           ].map(([k, v]) => h('div', { class: 'stat' }, h('div', { class: 'k' }, k), v instanceof Node ? v : h('div', { class: 'v' }, v))),
         ),
       ),
-      h('div', { class: 'card stack' }, h('h2', {}, t('detail.access')), seg, h('p', { class: 'muted' }, t(`detail.help.${a.visibility}`)), passwordBox),
+      h('div', { class: 'card stack' }, h('h2', {}, t('detail.access')), seg, visHelp, passwordBox),
       h(
         'div',
         { class: 'card stack' },
@@ -860,30 +1006,24 @@ async function viewDetail(id) {
         entryFiles.length > 1 ? h('label', { class: 'field' }, t('detail.entry'), entry) : null,
       ),
       analyticsCard,
-      h('div', { class: 'card stack' }, h('h2', {}, t('detail.uploadNew')), uploadPanel({ artifactId: id, currentEntry: a.entry, onDone: () => viewDetail(id) })),
+      h('div', { class: 'card stack' }, h('h2', {}, t('detail.uploadNew')), uploadPanel({ artifactId: id, currentEntry: () => a.entry, onDone: () => viewDetail(id) })),
       h('div', { class: 'card stack' }, h('h2', {}, t('detail.versions')), h('div', { class: 'table-wrap' }, h('table', { class: 'table' }, h('tbody', {}, versionRows)))),
-      h(
-        'details',
-        { class: 'card' },
-        h('summary', {}, h('strong', {}, t('detail.fileList', { n: files.items.length }))),
-        h('div', { class: 'table-wrap', style: 'margin-top:12px' }, h('table', { class: 'table' }, h('tbody', {}, fileRows))),
-      ),
+      fileListDetails,
       h('div', { class: 'row' }, del),
     ),
   );
 
-  if (useWae) {
-    api('GET', `/api/v1/analytics/views?ids=${encodeURIComponent(id)}`)
-      .then((res) => {
-        if (!viewsVal.isConnected) return;
+  if (viewsReq) {
+    viewsReq.then((out) => {
+      if (seq !== routeSeq || !viewsVal.isConnected) return;
+      if (out.ok) {
         viewsVal.classList.remove('muted');
-        viewsVal.textContent = res?.enabled ? Number(res.views?.[id] ?? 0).toLocaleString(locale()) : '—';
-      })
-      .catch(() => {
-        if (!viewsVal.isConnected) return;
+        viewsVal.textContent = out.res?.enabled ? Number(out.res.views?.[id] ?? 0).toLocaleString(locale()) : '—';
+      } else {
         viewsVal.textContent = '—';
         viewsVal.title = t('analytics.loadFailed');
-      });
+      }
+    });
   }
 }
 

@@ -35,8 +35,15 @@ const copyStatus = document.getElementById('reader:copy-status');
 const buttons = document.querySelectorAll('[data-view]');
 let ready = false;
 let rendered = false;
+let rawSource = null;
+let sourcePopulated = false;
 
 function select(view) {
+  if (view === 'source' && ready && !sourcePopulated) {
+    source.textContent = rawSource;
+    rawSource = null;
+    sourcePopulated = true;
+  }
   article.hidden = !rendered || view !== 'preview';
   source.hidden = !ready || view !== 'source';
   status.hidden = view === 'source' ? ready : rendered;
@@ -158,8 +165,10 @@ async function renderDiagrams() {
 }
 
 try {
-  const text = JSON.parse(document.getElementById('reader:markdown').textContent);
-  source.textContent = text;
+  const sourceNode = document.getElementById('reader:markdown');
+  const text = JSON.parse(sourceNode.textContent);
+  rawSource = text;
+  sourceNode.textContent = '';
   ready = true;
   article.innerHTML = parser.render(text);
   addCopyButtons();
