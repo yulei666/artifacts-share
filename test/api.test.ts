@@ -2584,7 +2584,8 @@ describe('Markdown shares', () => {
     expect(jsTag).toBeTruthy();
     const cached = await fetchRaw(`${a.content_url}__share/markdown/preview.js`, { headers: { 'if-none-match': jsTag! } });
     expect(cached.status).toBe(304);
-    const chunkPath = bundle.match(/import\("\.\/(chunks\/[^"]+\.js)"\)/)?.[1];
+    const chunkPath = bundle.match(/import\("(?:\/__share\/markdown\/|\.?\/)(chunks\/[^"]+\.js)"\)/)?.[1];
+    expect(chunkPath).toBeDefined();
     const chunk = await fetchRaw(`${a.content_url}__share/markdown/${chunkPath}`);
     expect(chunk.headers.get('cache-control')).toContain('immutable');
     await chunk.arrayBuffer();
@@ -2719,9 +2720,9 @@ describe('Markdown shares', () => {
     expect(js.status).toBe(200);
     expect(js.headers.get('content-type')).toContain('javascript');
     const bundle = await js.text();
-    const mermaid = bundle.match(/import\("\.\/(chunks\/mermaid[^"]+\.js)"\)/)?.[1];
-    expect(mermaid).toBeDefined();
-    const chunk = await fetchRaw(`${a.content_url}__share/markdown/${mermaid}`);
+    const diagramChunk = bundle.match(/import\("(?:\/__share\/markdown\/|\.?\/)(chunks\/markdown-diagram-[^"]+\.js)"\)/)?.[1];
+    expect(diagramChunk).toBeDefined();
+    const chunk = await fetchRaw(`${a.content_url}__share/markdown/${diagramChunk}`);
     expect(chunk.status).toBe(200);
     expect(chunk.headers.get('content-type')).toContain('javascript');
     await chunk.arrayBuffer();

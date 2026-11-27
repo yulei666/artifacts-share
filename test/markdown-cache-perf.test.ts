@@ -9,8 +9,15 @@ import {
   readerShellHash,
   resolveMarkdownAssets,
 } from '../src/content/markdown';
+import MarkdownIt from 'markdown-it';
 // @ts-expect-error Browser ES module bundled by esbuild (no .d.ts)
 import { highlightBlocks } from '../src/content/markdown-highlight.js';
+// @ts-expect-error Browser ES module bundled by esbuild (no .d.ts)
+import { mathPlugin } from '../src/content/markdown-math-plugin.js';
+// @ts-expect-error Browser ES module bundled by esbuild (no .d.ts)
+import { renderMath } from '../src/content/markdown-math.js';
+// @ts-expect-error Browser ES module bundled by esbuild (no .d.ts)
+import { MAX_RENDERED_DIAGRAMS, renderDiagrams } from '../src/content/markdown-diagram.js';
 
 const MAIN = 'https://share.example.com';
 const ORIGIN = { origin: MAIN };
@@ -449,7 +456,7 @@ describe('SPA fallback Edge Cache (Plan 2.1)', () => {
   });
 });
 
-describe('Hashed Markdown preview assets & dynamic highlight.js chunking (Plan 2.2)', () => {
+describe('Hashed Markdown preview assets, CSP & lazy KaTeX/Highlights/Pele bundles', () => {
   it('resolves hashed preview assets via manifest.json, caches per env.ASSETS, falls back cleanly, and invalidates shell hash', async () => {
     const baseEnv = env as unknown as Env;
     const assets = await resolveMarkdownAssets(baseEnv);
@@ -510,7 +517,7 @@ describe('Hashed Markdown preview assets & dynamic highlight.js chunking (Plan 2
       .not.toBe(markdownEtag('"abc"', 'en', { js: 'preview-CCC333.js', css: 'preview-BBB222.css' }));
   });
 
-  it('serves hashed preview JS/CSS and lazy highlight chunk with immutable cache-control and keeps preview entry lean', async () => {
+  it('serves hashed preview JS/CSS, lazy math/highlight/diagram chunks, KaTeX CSS/woff2 assets, and enforces CSP + allowlist', async () => {
     const baseEnv = env as unknown as Env;
     const assets = await resolveMarkdownAssets(baseEnv);
     const a = await json(
@@ -521,6 +528,20 @@ describe('Hashed Markdown preview assets & dynamic highlight.js chunking (Plan 2
       }),
       201,
     );
+
+    // Reader HTML CSP includes wasm-unsafe-eval for @pierre/highlights, font-src for KaTeX woff2, and style-src.
+    const pageRes = await callWorker(baseEnv, a.content_url, {
+      headers: { 'sec-fetch-dest': 'document', 'accept-language': 'en', 'user-agent': BROWSER_UA },
+    });
+    expect(pageRes.res.status).toBe(200);
+    const origin = new URL(a.content_url).origin;
+    const csp = pageRes.res.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain(`script-src ${origin}/__share/markdown/ 'wasm-unsafe-eval'`);
+    expect(csp).toContain("style-src 'self' 'unsafe-inline'");
+    expect(csp).toContain(`font-src ${origin}/__share/markdown/`);
+    await pageRes.res.arrayBuffer();
+    await pageRes.flush();
 
     // Hashed JS & CSS are served with immutable caching (including on 304 revalidation).
     const jsRes = await callWorker(baseEnv, `${a.content_url}__share/markdown/${assets.js}`);
@@ -543,7 +564,7 @@ describe('Hashed Markdown preview assets & dynamic highlight.js chunking (Plan 2
     expect(cssRes.res.status).toBe(200);
     expect(cssRes.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
     const cssEtag = cssRes.res.headers.get('etag')!;
-    await cssRes.res.arrayBuffer();
+    const cssText = await cssRes.res.text();
     await cssRes.flush();
 
     const css304 = await callWorker(baseEnv, `${a.content_url}__share/markdown/${assets.css}`, {
@@ -554,7 +575,7 @@ describe('Hashed Markdown preview assets & dynamic highlight.js chunking (Plan 2
     await css304.res.arrayBuffer();
     await css304.flush();
 
-    // Legacy preview.js still works (not immutable on 200 or 304) and manifest.json is not publicly exposed.
+    // Legacy preview.js still works (not immutable on 200 or 304).
     const legacyJs = await callWorker(baseEnv, `${a.content_url}__share/markdown/preview.js`);
     expect(legacyJs.res.status).toBe(200);
     expect(legacyJs.res.headers.get('cache-control') ?? '').not.toContain('immutable');
@@ -570,40 +591,294 @@ describe('Hashed Markdown preview assets & dynamic highlight.js chunking (Plan 2
     await legacy304.res.arrayBuffer();
     await legacy304.flush();
 
-    const manifestRes = await callWorker(baseEnv, `${a.content_url}__share/markdown/manifest.json`);
-    expect(manifestRes.res.status).toBe(404);
-    await manifestRes.res.arrayBuffer();
-    await manifestRes.flush();
+    // Allowlist rejects manifest.json, disallowed extensions, and traversal paths.
+    for (const badPath of ['manifest.json', 'assets/evil.js', 'assets/KaTeX_Main-Regular.ttf', 'assets/KaTeX_Main-Regular.woff', 'chunks/evil.wasm', '../fflate.js']) {
+      const badRes = await callWorker(baseEnv, `${a.content_url}__share/markdown/${badPath}`);
+      expect(badRes.res.status).toBe(404);
+      await badRes.res.arrayBuffer();
+      await badRes.flush();
+    }
 
-    // Preview entry dynamically imports the separate highlight.js chunk and does not eagerly bundle hljs.
-    const hljsChunk = jsText.match(/import\("\.\/(chunks\/markdown-highlight-[^"]+\.js)"\)/)?.[1];
-    expect(hljsChunk).toBeDefined();
-    expect(jsText).not.toContain('hljs-keyword');
+    // Preview entry stays lean: does NOT eagerly bundle KaTeX, @pierre/highlights WASM, or Pele.
+    expect(jsText).not.toContain('katex-mathml');
+    expect(jsText).not.toContain('WebAssembly.Module');
+    expect(jsText).not.toContain('PeleError');
+    expect(cssText).not.toContain('KaTeX_Main');
 
-    const chunkRes = await callWorker(baseEnv, `${a.content_url}__share/markdown/${hljsChunk}`);
-    expect(chunkRes.res.status).toBe(200);
-    expect(chunkRes.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
-    const chunkEtag = chunkRes.res.headers.get('etag')!;
-    const chunkText = await chunkRes.res.text();
-    expect(chunkText).toContain('hljs');
-    await chunkRes.flush();
+    const mathChunk = jsText.match(/import\("(?:\/__share\/markdown\/|\.?\/)(chunks\/markdown-math-[^"]+\.js)"\)/)?.[1];
+    const highlightChunk = jsText.match(/import\("(?:\/__share\/markdown\/|\.?\/)(chunks\/markdown-highlight-[^"]+\.js)"\)/)?.[1];
+    const diagramChunk = jsText.match(/import\("(?:\/__share\/markdown\/|\.?\/)(chunks\/markdown-diagram-[^"]+\.js)"\)/)?.[1];
+    expect(mathChunk).toBeDefined();
+    expect(highlightChunk).toBeDefined();
+    expect(diagramChunk).toBeDefined();
 
-    const chunk304 = await callWorker(baseEnv, `${a.content_url}__share/markdown/${hljsChunk}`, {
-      headers: { 'if-none-match': chunkEtag },
+    // Verify all 3 lazy chunks serve with immutable caching on 200 and 304.
+    const mathChunkRes = await callWorker(baseEnv, `${a.content_url}__share/markdown/${mathChunk}`);
+    expect(mathChunkRes.res.status).toBe(200);
+    expect(mathChunkRes.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    const mathChunkText = await mathChunkRes.res.text();
+    await mathChunkRes.flush();
+
+    const hlChunkRes = await callWorker(baseEnv, `${a.content_url}__share/markdown/${highlightChunk}`);
+    expect(hlChunkRes.res.status).toBe(200);
+    expect(hlChunkRes.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    const hlChunkEtag = hlChunkRes.res.headers.get('etag')!;
+    const hlChunkText = await hlChunkRes.res.text();
+    expect(hlChunkText).toContain('code-highlighted');
+    await hlChunkRes.flush();
+
+    const hlChunk304 = await callWorker(baseEnv, `${a.content_url}__share/markdown/${highlightChunk}`, {
+      headers: { 'if-none-match': hlChunkEtag },
     });
-    expect(chunk304.res.status).toBe(304);
-    expect(chunk304.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
-    await chunk304.res.arrayBuffer();
-    await chunk304.flush();
+    expect(hlChunk304.res.status).toBe(304);
+    expect(hlChunk304.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    await hlChunk304.res.arrayBuffer();
+    await hlChunk304.flush();
+
+    const diagChunkRes = await callWorker(baseEnv, `${a.content_url}__share/markdown/${diagramChunk}`);
+    expect(diagChunkRes.res.status).toBe(200);
+    expect(diagChunkRes.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    await diagChunkRes.res.arrayBuffer();
+    await diagChunkRes.flush();
+
+    // Lazy KaTeX CSS and referenced woff2 font are served with immutable caching on both 200 and 304.
+    const katexCssPath = mathChunkText.match(/\/__share\/markdown\/(assets\/katex-[^"]+\.css)/)?.[1];
+    expect(katexCssPath).toBeDefined();
+    const katexCssRes = await callWorker(baseEnv, `${a.content_url}__share/markdown/${katexCssPath}`);
+    expect(katexCssRes.res.status).toBe(200);
+    expect(katexCssRes.res.headers.get('content-type')).toContain('text/css');
+    expect(katexCssRes.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    const katexCssEtag = katexCssRes.res.headers.get('etag')!;
+    const katexCssText = await katexCssRes.res.text();
+    expect(katexCssText).not.toContain('.ttf');
+    expect(katexCssText).not.toContain('.woff"');
+    await katexCssRes.flush();
+
+    const katexCss304 = await callWorker(baseEnv, `${a.content_url}__share/markdown/${katexCssPath}`, {
+      headers: { 'if-none-match': katexCssEtag },
+    });
+    expect(katexCss304.res.status).toBe(304);
+    expect(katexCss304.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    await katexCss304.res.arrayBuffer();
+    await katexCss304.flush();
+
+    const woff2Path = katexCssText.match(/\/__share\/markdown\/(assets\/KaTeX_[^")]+\.woff2)/)?.[1];
+    expect(woff2Path).toBeDefined();
+    const woff2Res = await callWorker(baseEnv, `${a.content_url}__share/markdown/${woff2Path}`);
+    expect(woff2Res.res.status).toBe(200);
+    expect(woff2Res.res.headers.get('content-type')).toContain('font/woff2');
+    expect(woff2Res.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    const woff2Etag = woff2Res.res.headers.get('etag')!;
+    expect((await woff2Res.res.arrayBuffer()).byteLength).toBeGreaterThan(0);
+    await woff2Res.flush();
+
+    const woff2304 = await callWorker(baseEnv, `${a.content_url}__share/markdown/${woff2Path}`, {
+      headers: { 'if-none-match': woff2Etag },
+    });
+    expect(woff2304.res.status).toBe(304);
+    expect(woff2304.res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    await woff2304.res.arrayBuffer();
+    await woff2304.flush();
   });
 
-  it('highlightBlocks highlights supported languages in place, adds hljs class, and skips unknown/oversized blocks', () => {
+  it('mathPlugin tokenizes block/inline math safely and renderMath renders KaTeX with trust:false', async () => {
+    const md = new MarkdownIt({ html: false }).use(mathPlugin);
+
+    // Block & inline math.
+    const singleBlock = md.render('$$E = mc^2$$\n');
+    expect(singleBlock).toContain('<div class="math-block" data-math="E = mc^2">E = mc^2</div>');
+
+    const multiBlock = md.render('$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$\n');
+    expect(multiBlock).toContain('<div class="math-block" data-math="\\int_0^1 x^2\\,dx = \\frac{1}{3}">');
+
+    const inline = md.render('Pythagoras: $a^2 + b^2 = c^2$ holds.\n');
+    expect(inline).toContain('<span class="math-inline" data-math="a^2 + b^2 = c^2">a^2 + b^2 = c^2</span>');
+
+    // Currency, whitespace-delimited, escaped, inline code, and fenced code are NOT parsed as math.
+    const excluded = md.render([
+      'Prices: $5, $10 and $20, $5-$10, $ 5 + 3 $, \\$escaped\\$.',
+      'Inline code: `$x^2$` and fenced:',
+      '```',
+      '$$E = mc^2$$',
+      '```',
+    ].join('\n'));
+    expect(excluded).not.toContain('math-inline');
+    expect(excluded).not.toContain('math-block');
+
+    // HTML escaping protects raw placeholder attributes and text.
+    const xss = md.render('$$<script>alert("x")</script> & a < b$$\n\nInline $x < y & "z"$.\n');
+    expect(xss).not.toContain('<script>');
+    expect(xss).toContain('&lt;script&gt;');
+    expect(xss).toContain('&amp;');
+
+    // Repeated unclosed `$$` lines stay linear-time (non-quadratic) and unclosed `$$` before a fence does not swallow the fence.
+    const t0 = performance.now();
+    const manyUnclosed = md.render('$$ x\n'.repeat(15_000));
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(manyUnclosed).not.toContain('math-block');
+
+    const unclosedBeforeFence = md.render('$$\nnot closed\n\n```text\n$$\n```\n');
+    expect(unclosedBeforeFence).not.toContain('math-block');
+    expect(unclosedBeforeFence).toContain('<pre><code class="language-text">');
+
+    // Minimal DOM mock to run renderMath + KaTeX in workerd.
+    type MockNode = {
+      nodeType: number;
+      tagName?: string;
+      textContent: string;
+      className: string;
+      children: MockNode[];
+      attrs: Record<string, string>;
+      style: Record<string, string> & { setProperty(k: string, v: string): void };
+      isConnected: boolean;
+      classList: { contains(c: string): boolean; add(c: string): void };
+      getAttribute(k: string): string | null;
+      setAttribute(k: string, v: string): void;
+      appendChild(child: MockNode): MockNode;
+      append(...nodes: MockNode[]): void;
+      toText(): string;
+      hasTag(tag: string): boolean;
+    };
+    const makeNode = (tagName?: string, text = ''): MockNode => {
+      const classes = new Set<string>();
+      const attrs: Record<string, string> = {};
+      const children: MockNode[] = [];
+      const styleObj = {
+        setProperty(k: string, v: string) {
+          (styleObj as unknown as Record<string, string>)[k] = v;
+        },
+      } as MockNode['style'];
+      const node: MockNode = {
+        nodeType: tagName ? 1 : 3,
+        tagName,
+        textContent: text,
+        get className() {
+          return [...classes].join(' ');
+        },
+        set className(v: string) {
+          classes.clear();
+          for (const part of String(v).split(/\s+/).filter(Boolean)) classes.add(part);
+        },
+        children,
+        attrs,
+        style: styleObj,
+        isConnected: true,
+        classList: {
+          contains: (c: string) => classes.has(c),
+          add: (c: string) => { classes.add(c); },
+        },
+        getAttribute: (k: string) => (k in attrs ? attrs[k] : null),
+        setAttribute: (k: string, v: string) => {
+          attrs[k] = String(v);
+          if (k === 'class') node.className = String(v);
+        },
+        appendChild: (child: MockNode) => {
+          children.push(child);
+          return child;
+        },
+        append: (...nodes: MockNode[]) => {
+          children.push(...nodes);
+        },
+        toText: () => (node.nodeType === 3 ? node.textContent : children.map((c) => c.toText()).join('')),
+        hasTag: (tag: string) => node.tagName?.toLowerCase() === tag.toLowerCase() || children.some((c) => c.hasTag(tag)),
+      };
+      return node;
+    };
+
+    const prevDocument = (globalThis as Record<string, unknown>).document;
+    const mockDocument = {
+      compatMode: 'CSS1Compat',
+      head: null,
+      createElement: (tag: string) => makeNode(tag),
+      createElementNS: (_ns: string, tag: string) => makeNode(tag),
+      createTextNode: (text: string) => makeNode(undefined, text),
+      createDocumentFragment: () => makeNode('#fragment'),
+    };
+    (globalThis as Record<string, unknown>).document = mockDocument;
+    try {
+      const inlineEl = makeNode('span', 'E = mc^2');
+      inlineEl.className = 'math-inline';
+      inlineEl.setAttribute('data-math', 'E = mc^2');
+
+      const untrustedEl = makeNode('div', '\\href{javascript:alert(1)}{click}');
+      untrustedEl.className = 'math-block';
+      untrustedEl.setAttribute('data-math', '\\href{javascript:alert(1)}{click}');
+
+      const deepTex = '{'.repeat(5000) + 'x' + '}'.repeat(5000);
+      const deepEl = makeNode('div', deepTex);
+      deepEl.className = 'math-block';
+      deepEl.setAttribute('data-math', deepTex);
+
+      const article = {
+        querySelectorAll: () => [inlineEl, untrustedEl, deepEl],
+      };
+      await renderMath(article);
+
+      expect(inlineEl.children.length).toBeGreaterThan(0);
+      expect(inlineEl.hasTag('math')).toBe(true);
+      // trust: false blocks \href from producing an <a> element.
+      expect(untrustedEl.hasTag('a')).toBe(false);
+      // Non-ParseError throws (e.g. deep-brace RangeError) restore raw TeX fallback instead of clearing the element.
+      expect(deepEl.textContent).toBe(deepTex);
+      expect(deepEl.children).toHaveLength(0);
+    } finally {
+      if (prevDocument === undefined) delete (globalThis as Record<string, unknown>).document;
+      else (globalThis as Record<string, unknown>).document = prevDocument;
+    }
+  });
+
+  it('highlightBlocks uses @pierre/highlights with dual-theme CSS vars, preserves textContent, stays XSS-safe, and skips invalid blocks', () => {
+    type DomChild =
+      | { type: 'text'; textContent: string }
+      | { type: 'span'; className: string; textContent: string; style: Record<string, string> & { setProperty(k: string, v: string): void } };
+
+    const makeMockDoc = () => ({
+      createDocumentFragment() {
+        const children: DomChild[] = [];
+        return {
+          children,
+          append(...items: DomChild[]) {
+            children.push(...items);
+          },
+        };
+      },
+      createTextNode(text: string): DomChild {
+        return { type: 'text', textContent: text };
+      },
+      createElement(): DomChild {
+        const style = {
+          setProperty(k: string, v: string) {
+            (style as unknown as Record<string, string>)[k] = v;
+          },
+        } as Record<string, string> & { setProperty(k: string, v: string): void };
+        return { type: 'span', className: '', textContent: '', style };
+      },
+    });
+
     const makeCode = (text: string, isConnected = true) => {
       const classes = new Set<string>();
+      const ownerDocument = makeMockDoc();
+      let rendered: DomChild[] = [];
+      let innerHtmlTouched = false;
       return {
         isConnected,
         textContent: text,
-        innerHTML: '',
+        ownerDocument,
+        get children() {
+          return rendered;
+        },
+        get renderedText() {
+          return rendered.map((c) => c.textContent).join('');
+        },
+        get innerHtmlTouched() {
+          return innerHtmlTouched;
+        },
+        set innerHTML(_v: string) {
+          innerHtmlTouched = true;
+        },
+        replaceChildren(fragment: { children: DomChild[] }) {
+          rendered = fragment.children;
+        },
         classList: {
           add: (c: string) => classes.add(c),
           has: (c: string) => classes.has(c),
@@ -611,29 +886,115 @@ describe('Hashed Markdown preview assets & dynamic highlight.js chunking (Plan 2
       };
     };
 
-    const jsCode = makeCode('const x = 42;');
+    const jsSource = 'const msg = "<script>alert(1)</script>";\r\n// comment\nreturn 42;';
+    const jsCode = makeCode(jsSource);
+    const mermaidCode = makeCode('flowchart LR\n  A --> B');
+    const plainCode = makeCode('plain text');
     const unknownCode = makeCode('some text');
     const hugeCode = makeCode('a'.repeat(64 * 1024 + 1));
     const detachedCode = makeCode('const y = 1;', false);
 
     highlightBlocks([
       { code: jsCode, lang: 'js' },
+      { code: mermaidCode, lang: 'mermaid' },
+      { code: plainCode, lang: 'text' },
       { code: unknownCode, lang: 'definitely-not-a-lang' },
       { code: hugeCode, lang: 'js' },
       { code: detachedCode, lang: 'js' },
     ]);
 
-    expect(jsCode.innerHTML).toContain('hljs-keyword');
-    expect(jsCode.innerHTML).toContain('hljs-number');
-    expect(jsCode.classList.has('hljs')).toBe(true);
-    // Stripping HTML tags from highlighted output preserves the exact source text for copy buttons.
-    expect(jsCode.innerHTML.replace(/<[^>]+>/g, '')).toBe('const x = 42;');
+    expect(jsCode.classList.has('code-highlighted')).toBe(true);
+    expect(jsCode.innerHtmlTouched).toBe(false);
+    expect(jsCode.renderedText).toBe(jsSource);
+    const styledSpans = jsCode.children.filter((c): c is Extract<DomChild, { type: 'span' }> => c.type === 'span');
+    expect(styledSpans.length).toBeGreaterThan(0);
+    expect(styledSpans.every((s) => s.className === 'code-tok')).toBe(true);
+    expect(styledSpans.some((s) => Boolean(s.style['--tok-light']) && Boolean(s.style['--tok-dark']))).toBe(true);
 
-    expect(unknownCode.innerHTML).toBe('');
-    expect(unknownCode.classList.has('hljs')).toBe(false);
-    expect(hugeCode.innerHTML).toBe('');
-    expect(hugeCode.classList.has('hljs')).toBe(false);
-    expect(detachedCode.innerHTML).toBe('');
-    expect(detachedCode.classList.has('hljs')).toBe(false);
+    for (const skipped of [mermaidCode, plainCode, unknownCode, hugeCode, detachedCode]) {
+      expect(skipped.children).toHaveLength(0);
+      expect(skipped.classList.has('code-highlighted')).toBe(false);
+    }
+  });
+
+  it('renderDiagrams renders flowchart/sequence/mmd/mixed-case Mermaid SVG via pele/lazy, disables links/images, falls back on bad syntax, and enforces the 20-diagram cap', async () => {
+    const makeArticle = (entries: Array<string | { source: string; lang?: string }>) => {
+      const blocks = entries.map((entry) => {
+        const { source, lang = 'mermaid' } = typeof entry === 'string' ? { source: entry } : entry;
+        const className = `language-${lang}`;
+        const classes = new Set([className]);
+        const block = {
+          isConnected: true,
+          replacedWith: null as null | { tagName: string; className: string; innerHTML: string },
+          replaceWith(node: { tagName: string; className: string; innerHTML: string }) {
+            block.replacedWith = node;
+            block.isConnected = false;
+          },
+        };
+        const code = {
+          isConnected: true,
+          textContent: source,
+          className,
+          classList: {
+            contains: (c: string) => classes.has(c),
+            [Symbol.iterator]: () => classes.values(),
+          },
+          parentElement: block,
+          closest: (sel: string) => (sel === '.code-block' ? block : null),
+        };
+        return { block, code };
+      });
+      const ownerDocument = {
+        defaultView: {},
+        createElement: (tagName: string) => ({ tagName, className: '', innerHTML: '' }),
+      };
+      const article = {
+        clientWidth: 720,
+        ownerDocument,
+        querySelectorAll: () => blocks.map((b) => b.code),
+      };
+      return { article, blocks };
+    };
+
+    // Flowchart, sequence, mmd alias, mixed-case Mermaid, non-mermaid skip, link/image stripping, and invalid syntax fallback.
+    const { article, blocks } = makeArticle([
+      'flowchart LR\n  A[Start] --> B[End]\n  click A href "https://example.com" "Open"',
+      'sequenceDiagram\n  Alice->>Bob: Hello',
+      { source: 'flowchart TD\n  X --> Y', lang: 'mmd' },
+      { source: 'flowchart TD\n  M --> N', lang: 'Mermaid' },
+      { source: 'const x = 1;', lang: 'js' },
+      'not a valid mermaid diagram @@@',
+    ]);
+    await renderDiagrams(article);
+
+    expect(blocks[0].block.replacedWith?.tagName).toBe('figure');
+    expect(blocks[0].block.replacedWith?.className).toBe('diagram');
+    expect(blocks[0].block.replacedWith?.innerHTML).toContain('<svg');
+    expect(blocks[0].block.replacedWith?.innerHTML).toContain('pele-flowchart');
+    expect(blocks[0].block.replacedWith?.innerHTML).not.toContain('<a ');
+    expect(blocks[0].block.replacedWith?.innerHTML).not.toContain('https://example.com');
+    expect(blocks[0].block.replacedWith?.innerHTML).not.toContain('<image');
+
+    expect(blocks[1].block.replacedWith?.innerHTML).toContain('<svg');
+    expect(blocks[1].block.replacedWith?.innerHTML).toContain('pele-sequence');
+
+    // `mmd` alias and mixed-case `Mermaid` also render as diagrams.
+    expect(blocks[2].block.replacedWith?.innerHTML).toContain('pele-flowchart');
+    expect(blocks[3].block.replacedWith?.innerHTML).toContain('pele-flowchart');
+
+    // Non-mermaid language blocks and invalid syntax diagrams keep original code blocks intact.
+    expect(blocks[4].block.replacedWith).toBeNull();
+    expect(blocks[4].block.isConnected).toBe(true);
+    expect(blocks[5].block.replacedWith).toBeNull();
+    expect(blocks[5].block.isConnected).toBe(true);
+
+    // 20-diagram cap leaves diagrams beyond MAX_RENDERED_DIAGRAMS untouched.
+    const many = Array.from({ length: MAX_RENDERED_DIAGRAMS + 2 }, (_, i) => `flowchart LR\n  A${i} --> B${i}`);
+    const capped = makeArticle(many);
+    await renderDiagrams(capped.article);
+    const renderedCount = capped.blocks.filter((b) => b.block.replacedWith !== null).length;
+    expect(renderedCount).toBe(MAX_RENDERED_DIAGRAMS);
+    expect(capped.blocks[MAX_RENDERED_DIAGRAMS].block.replacedWith).toBeNull();
+    expect(capped.blocks[MAX_RENDERED_DIAGRAMS + 1].block.replacedWith).toBeNull();
   });
 });
