@@ -1,11 +1,17 @@
 import MarkdownIt from 'markdown-it';
 import GithubSlugger from 'github-slugger';
+import { mathPlugin } from './markdown-math-plugin.js';
 import './markdown-preview.css';
 
-const MAX_RENDERED_DIAGRAMS = 20;
 const MAX_HIGHLIGHT_CHARS = 64 * 1024;
+const MERMAID_LANGS = new Set(['mermaid', 'mmd']);
+const SKIP_HIGHLIGHT_LANGS = new Set(['mermaid', 'mmd', 'plain', 'plaintext', 'text', 'txt']);
 
-const parser = new MarkdownIt({ html: false });
+function codeLanguage(code) {
+  return [...code.classList].find((name) => name.startsWith('language-'))?.slice('language-'.length) ?? '';
+}
+
+const parser = new MarkdownIt({ html: false }).use(mathPlugin);
 
 const article = document.getElementById('reader:preview');
 const source = document.getElementById('reader:source');
@@ -117,11 +123,17 @@ function addCopyButtons() {
   }
 }
 
+async function renderMathBlocks() {
+  if (!article.querySelector('.math-block[data-math], .math-inline[data-math]')) return;
+  const { renderMath } = await import('./markdown-math.js');
+  await renderMath(article);
+}
+
 async function highlightCode() {
   const blocks = [];
   for (const code of article.querySelectorAll('pre > code[class*="language-"]')) {
-    const lang = [...code.classList].find((name) => name.startsWith('language-'))?.slice('language-'.length);
-    if (!lang || lang.toLowerCase() === 'mermaid') continue;
+    const lang = codeLanguage(code);
+    if (!lang || SKIP_HIGHLIGHT_LANGS.has(lang.toLowerCase())) continue;
     if ((code.textContent ?? '').length > MAX_HIGHLIGHT_CHARS) continue;
     blocks.push({ code, lang });
   }
@@ -131,29 +143,12 @@ async function highlightCode() {
 }
 
 async function renderDiagrams() {
-  const diagrams = article.querySelectorAll('pre > code.language-mermaid');
-  if (!diagrams.length) return;
-  const { default: mermaid } = await import('mermaid');
-  mermaid.initialize({
-    startOnLoad: false,
-    securityLevel: 'strict',
-    htmlLabels: false,
-    suppressErrorRendering: true,
-    theme: matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default',
-  });
-  // Bound the total layout work and leave any remaining diagrams readable as code.
-  for (let index = 0; index < Math.min(diagrams.length, MAX_RENDERED_DIAGRAMS); index++) {
-    const code = diagrams[index];
-    try {
-      const { svg } = await mermaid.render(`markdown-diagram-${crypto.randomUUID()}`, code.textContent);
-      const figure = document.createElement('figure');
-      figure.className = 'diagram';
-      figure.innerHTML = svg;
-      code.closest('.code-block').replaceWith(figure);
-    } catch {
-      // Keep the original code block when a diagram cannot be rendered.
-    }
-  }
+  const hasDiagram = [...article.querySelectorAll('pre > code[class*="language-"]')].some((code) =>
+    MERMAID_LANGS.has(codeLanguage(code).toLowerCase()),
+  );
+  if (!hasDiagram) return;
+  const { renderDiagrams: renderPeleDiagrams } = await import('./markdown-diagram.js');
+  await renderPeleDiagrams(article);
 }
 
 try {
@@ -172,6 +167,7 @@ try {
     // The heading did not exist when the browser first processed the fragment.
     try { document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView(); } catch {}
   }
+  void renderMathBlocks().catch(() => {});
   void highlightCode().catch(() => {});
   void renderDiagrams().catch(() => {});
 } catch {

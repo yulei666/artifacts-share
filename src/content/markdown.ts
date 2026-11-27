@@ -11,7 +11,7 @@ export interface MarkdownAssets {
 }
 
 const DEFAULT_ASSETS: MarkdownAssets = { js: 'preview.js', css: 'preview.css' };
-const ASSET_PATH_RE = /^(?:preview(?:-[A-Za-z0-9_-]+)?\.(?:js|css)|chunks\/[\w.-]+\.js)$/;
+const ASSET_PATH_RE = /^(?:preview(?:-[A-Za-z0-9_-]+)?\.(?:js|css)|chunks\/[\w.-]+\.(?:js|css)|assets\/[\w.-]+\.(?:woff2|css))$/;
 const HASHED_PREVIEW_RE = /^preview-[A-Za-z0-9_-]+\.(?:js|css)$/;
 const MANIFEST_JS_RE = /^preview(?:-[A-Za-z0-9_-]+)?\.js$/;
 const MANIFEST_CSS_RE = /^preview(?:-[A-Za-z0-9_-]+)?\.css$/;
@@ -60,7 +60,7 @@ export async function markdownAsset(req: Request, env: Env, url: URL): Promise<R
   if (!ASSET_PATH_RE.test(path)) return new Response(null, { status: 404 });
   if (req.method !== 'GET' && req.method !== 'HEAD') return new Response(null, { status: 405, headers: { allow: 'GET, HEAD' } });
   const isLegacyPreview = path === 'preview.js' || path === 'preview.css';
-  const isImmutable = path.startsWith('chunks/') || HASHED_PREVIEW_RE.test(path);
+  const isImmutable = path.startsWith('chunks/') || path.startsWith('assets/') || HASHED_PREVIEW_RE.test(path);
   let target = path;
   if (isLegacyPreview) {
     const assets = await resolveMarkdownAssets(env);
@@ -91,7 +91,7 @@ export async function markdownAsset(req: Request, env: Env, url: URL): Promise<R
 }
 
 /** Bump when the reader response changes in a way the hashed inputs below do not capture (e.g. headers). */
-const SHELL_VERSION = 2;
+const SHELL_VERSION = 3;
 const shellHashes = new Map<string, string>();
 export function readerShellHash(assets: MarkdownAssets = DEFAULT_ASSETS): string {
   const key = `${assets.js}\0${assets.css}`;
@@ -160,9 +160,10 @@ export function markdownPage(
   headers.set('content-type', 'text/html; charset=utf-8');
   headers.set('referrer-policy', 'no-referrer');
   headers.append('vary', 'sec-fetch-dest, accept');
+  const origin = new URL(req.url).origin;
   headers.set('content-security-policy',
-    `default-src 'none'; script-src ${new URL(req.url).origin}${PREFIX}; style-src 'self' 'unsafe-inline'; ` +
-    `img-src 'self' https: data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors ${ctx.ancestors}`,
+    `default-src 'none'; script-src ${origin}${PREFIX} 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; ` +
+    `font-src ${origin}${PREFIX}; img-src 'self' https: data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors ${ctx.ancestors}`,
   );
   if (notModified) return new Response(null, { status: 304, headers });
   if (req.method === 'HEAD') return new Response(null, { headers });
