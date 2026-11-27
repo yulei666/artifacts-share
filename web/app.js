@@ -42,6 +42,19 @@ const visLabel = (v) => t(`vis.${v}`);
 const badge = (v) => h('span', { class: `badge ${v}` }, visLabel(v));
 const infoTip = (text) => h('span', { class: 'info-tip', tabindex: '0', role: 'img', 'aria-label': text, 'data-tip': text }, 'i');
 const encodePath = (p) => p.split('/').map(encodeURIComponent).join('/');
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function externalIcon() {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('class', 'ico');
+  svg.setAttribute('aria-hidden', 'true');
+  for (const d of ['M7 17L17 7', 'M9 7h8v8']) {
+    const p = document.createElementNS(SVG_NS, 'path');
+    p.setAttribute('d', d);
+    svg.append(p);
+  }
+  return svg;
+}
 
 const langButton = (extraClass = '') =>
   langToggle(extraClass, () => {
@@ -310,7 +323,16 @@ async function viewList() {
       h(
         'thead',
         {},
-        h('tr', {}, h('th', {}, t('list.colTitle')), h('th', {}, t('list.colAccess')), h('th', { class: 'hide-sm' }, t('list.colSize')), viewsTh, h('th', {}, t('list.colUpdated'))),
+        h(
+          'tr',
+          {},
+          h('th', {}, t('list.colTitle')),
+          h('th', {}, t('list.colAccess')),
+          h('th', { class: 'hide-sm' }, t('list.colSize')),
+          viewsTh,
+          h('th', {}, t('list.colUpdated')),
+          h('th', { class: 'col-action', 'aria-label': t('list.openShare') }),
+        ),
       ),
       tbody,
     ),
@@ -353,15 +375,36 @@ async function viewList() {
     if (mine !== seq || !tbody.isConnected) return;
     if (reset) tbody.replaceChildren();
     const pageCells = new Map();
+    const openLabel = t('list.openShare');
     for (const a of data.items) {
       const viewCell = useWae
         ? h('td', { class: 'hide-sm muted', title: t('list.colViews90dHint') }, '…')
         : h('td', { class: 'hide-sm muted' }, a.view_count);
       if (useWae) pageCells.set(a.id, viewCell);
+      const rowTitle = a.title || t('common.untitled');
+      const openLink = h(
+        'a',
+        {
+          class: 'row-open',
+          href: a.url,
+          target: '_blank',
+          rel: 'noopener',
+          title: openLabel,
+          'aria-label': `${openLabel}: ${rowTitle}`,
+          onclick: (e) => e.stopPropagation(),
+        },
+        externalIcon(),
+      );
       tbody.append(
         h(
           'tr',
-          { class: 'click', onclick: () => go(`/a/${a.id}`) },
+          {
+            class: 'click',
+            onclick: (e) => {
+              if (e.target?.closest?.('a, button')) return;
+              go(`/a/${a.id}`);
+            },
+          },
           h(
             'td',
             { class: 'title-cell' },
@@ -372,6 +415,7 @@ async function viewList() {
           h('td', { class: 'hide-sm muted' }, fmtBytes(a.total_size)),
           viewCell,
           h('td', { class: 'muted' }, fmtAgo(a.updated_at)),
+          h('td', { class: 'col-action' }, openLink),
         ),
       );
     }
